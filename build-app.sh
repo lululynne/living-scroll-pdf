@@ -26,8 +26,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>LivingScrollPDF</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleVersion</key><string>2</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
@@ -38,5 +38,8 @@ PLIST
 # A stable signing identity keeps the Screen Recording grant valid across rebuilds;
 # ad-hoc signatures change every build and macOS silently stops honoring the toggle.
 IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development|Developer ID Application/{print $2; exit}')}"
-codesign --force --sign "${IDENTITY:--}" "$APP"
+# Notarization requires Hardened Runtime and a secure timestamp on Developer ID builds.
+SIGN_FLAGS=()
+[[ "$IDENTITY" == "Developer ID Application"* ]] && SIGN_FLAGS=(--options runtime --timestamp)
+codesign --force "${SIGN_FLAGS[@]}" --sign "${IDENTITY:--}" "$APP"
 echo "built $APP"

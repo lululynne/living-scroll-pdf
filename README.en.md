@@ -13,7 +13,7 @@ Why it exists: more and more work happens inside cloud agents (web-based assista
 ## How it differs from ordinary "scrolling capture"
 
 - **Captures the window, not the screen.** ScreenCaptureKit grabs only the selected window's own pixels: other windows on top of it, the capture frame and the control bar never end up in the image. Move the window and the red frame follows.
-- **Just scroll by hand.** It samples a frame every 0.12 s, works out how many pixels the content moved, and appends only the newly revealed rows. Scrolling back, pausing, uneven speed — all fine. Or press "Auto-scroll to bottom" and let it scroll; it wraps up when nothing moves anymore.
+- **Just scroll by hand.** It samples a frame every 0.12 s, works out how many pixels the content moved, and appends only the newly revealed rows. Scrolling back, pausing, uneven speed — all fine. "Auto-scroll to bottom" comes with the paid version; manual scrolling stays free.
 - **Built for chat interfaces:**
   - fixed headers and fixed input boxes appear once, not repeated in every segment;
   - a blinking caret or a fading scrollbar is not mistaken for content;
@@ -33,7 +33,7 @@ A note on evidence: the SHA-256 shows a file is the same one produced at capture
    - drag a region inside the window (framing just the chat content works best); a plain click takes the whole window; Esc goes back / cancels;
    - once the red dashed frame appears, scroll that window normally;
    - click "Done" or press ⌃⌥S again. The PDF opens automatically; files go to `~/Desktop/Living Scroll PDF/` (`~/Desktop/卷轴PDF/` with the Chinese interface).
-4. "Auto-scroll to bottom" additionally needs **Accessibility** permission. Before each scroll it checks that the window under the scroll point really is the target; if something covers it, auto-scroll pauses instead of scrolling the wrong window.
+4. "Auto-scroll to bottom" comes with the paid version; once available it additionally needs **Accessibility** permission. Before each scroll it checks that the window under the scroll point really is the target; if something covers it, auto-scroll pauses instead of scrolling the wrong window.
 
 Currently only downward scrolling is supported (capture from the start of a conversation to its end). Requires macOS 14 or later. The interface is in English or Chinese, following your system language; switch it under Language in the menu.
 

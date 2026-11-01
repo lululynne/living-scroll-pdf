@@ -298,9 +298,16 @@ final class CaptureSession {
 
     // MARK: - Auto scroll
 
+    /// Off in the free build until licensing ships.
+    private static let autoModeAvailable = false
+
     private func toggleAuto() {
         if autoScroll {
             stopAuto()
+            return
+        }
+        guard Self.autoModeAvailable else {
+            update(L("自动滚动随付费版开放，手动滚动一直免费 · scroll.mymomentsmaker.com", "Auto-scroll comes with the paid version; manual scrolling stays free · scroll.mymomentsmaker.com"))
             return
         }
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
