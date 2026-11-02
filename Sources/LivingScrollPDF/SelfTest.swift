@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import ImageIO
 import PDFKit
 
 /// `LivingScrollPDF selftest`: feeds synthetic chat-like frames (sticky header, sticky input box
@@ -817,6 +818,11 @@ enum SelfTest {
                   PixelFrame(width: w, height: header + bodyH + footer, bytes: b).reachesOutsideWindow && !frame(offset: 0, cursor: false).reachesOutsideWindow)
         }
 
+        // Near-duplicate text lines from the 2026-11-02 TextEdit capture. The body repeats
+        // every 16px and only the line numbers differ. Before the proof gate, a manual flick
+        // past one screen was accepted at shift 132 while the frames shared no rows.
+        nearDuplicateLines(check)
+
         // 8. Export round trip.
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("livingscrollpdf-selftest-\(getpid())")
         do {
@@ -839,8 +845,27 @@ enum SelfTest {
             let subject = PDFDocument(url: partialPDF)?.documentAttributes?[PDFDocumentAttribute.subjectAttribute] as? String ?? ""
             check("partial export: file name, JSON and PDF subject say so",
                   partialPDF.lastPathComponent.contains(L("未完成", "partial")) && object?["isPartial"] as? Bool == true
-                  && object?["partialReason"] as? String == "ended-before-reconnecting" && subject.contains(L("未完成", "PARTIAL")),
+                  && object?["partialReason"] as? String == "ended-before-reconnecting" && object?["gaps"] == nil
+                  && subject.contains(L("未完成", "PARTIAL")),
                   "\(partialPDF.lastPathComponent) subject=\(subject)")
+            var gapped = partial
+            gapped.gaps = [ContentGap(afterRow: img.height, droppedFrames: 3, reason: "ended-before-reconnecting")]
+            let gapPDF = try Exporter.export(img, record: gapped, folder: dir)
+            let gapJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: gapPDF.deletingPathExtension().appendingPathExtension("json"))) as? [String: Any]
+            let gapList = gapJSON?["gaps"] as? [[String: Any]]
+            check("a recorded gap is in the JSON",
+                  gapList?.count == 1 && gapList?.first?["afterRow"] as? Int == img.height
+                  && gapList?.first?["droppedFrames"] as? Int == 3
+                  && gapList?.first?["reason"] as? String == "ended-before-reconnecting",
+                  "\(String(describing: gapList))")
+            check("version comes from the bundle, not a hard-coded 0.1.0",
+                  Exporter.releaseVersion(bundleShort: "0.2.0", bundleIdentifier: "io.github.lululynne.livingscrollpdf") == "0.2.0"
+                  && Exporter.releaseVersion(bundleShort: "1.0", bundleIdentifier: "io.github.lululynne.livingscrollpdf") == "1.0"
+                  && Exporter.releaseVersion(bundleShort: nil, bundleIdentifier: nil) == "dev"
+                  && Exporter.releaseVersion(bundleShort: "1.0", bundleIdentifier: "other") == "dev"
+                  && Exporter.releaseVersion(bundleShort: "  ", bundleIdentifier: nil) == "dev"
+                  && Exporter.version != "0.1.0",
+                  "cli=\(Exporter.version)")
             print("     output: \(dir.path)")
         } catch {
             check("export", false, "\(error)")
@@ -892,6 +917,100 @@ enum SelfTest {
             y += block
         }
         return bytes
+    }
+
+    /// TextEdit lines that repeat except for the line number (capture 2026-11-02).
+    /// A manual flick past one screen used to be accepted at a false small shift.
+    private static func nearDuplicateLines(_ check: (String, Bool, String) -> Void) {
+        let path = "/Users/lulu/Desktop/卷轴PDF/卷轴PDF-文字編輯-20261102-195435-未完成.png"
+        guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(src, 0, nil),
+              let full = PixelFrame(cgImage: image) else {
+            check("near-duplicate lines: field image", false, "load failed \(path)")
+            return
+        }
+        let hole = 63 * 16
+        let rb = full.width * 4
+        func slice(_ y: Int, _ h: Int) -> PixelFrame {
+            var bytes = [UInt8](repeating: 255, count: h * rb)
+            for row in 0..<h {
+                bytes.replaceSubrange(row * rb..<(row + 1) * rb, with: full.bytes[(y + row) * rb..<(y + row + 1) * rb])
+            }
+            return PixelFrame(width: full.width, height: h, bytes: bytes)
+        }
+        func matches(_ out: PixelFrame, docY: Int) -> Int? {
+            guard docY >= 0, docY + out.height <= full.height else { return -2 }
+            for r in 0..<out.height where out.bytes[r * rb..<(r + 1) * rb] != full.bytes[(docY + r) * rb..<(docY + r + 1) * rb] {
+                return r
+            }
+            return nil
+        }
+        let view = 384
+        let steady = Stitcher()
+        var y = hole
+        _ = steady.add(slice(y, view))
+        for _ in 0..<8 {
+            y += 32
+            _ = steady.add(slice(y, view))
+        }
+        if let img = steady.finish(), let out = PixelFrame(cgImage: img) {
+            let bad = matches(out, docY: hole)
+            check("near-duplicate lines: small steps stay exact",
+                  bad == nil && steady.lostFrames == 0 && !steady.needsRecovery,
+                  "bad=\(bad.map(String.init) ?? "none") lost=\(steady.lostFrames) h=\(out.height)")
+        } else {
+            check("near-duplicate lines: small steps stay exact", false, "no image")
+        }
+
+        // Lines 40...63 against lines 94...117: the two sides of the field hole share no rows.
+        let isolated = Stitcher()
+        _ = isolated.add(slice(hole - view, view))
+        let across = isolated.add(slice(hole, view))
+        check("near-duplicate lines: the field hole is not joined",
+              across == .lost && isolated.needsRecovery && isolated.gapFrames == 1,
+              "\(across) recovering=\(isolated.needsRecovery) gap=\(isolated.gapFrames)")
+
+        // Twelve small wheels, then a 900px jump. The last placed frame and the jumped
+        // frame do not overlap; shift 132 used to be accepted anyway.
+        for view in [384, 385] {
+            var tracker = ManualTracker(body: view, pixelScale: 1)
+            let st = Stitcher()
+            var y = hole
+            var t = 0.0
+            var jumpOutcome: Stitcher.Outcome?
+            func push(_ ny: Int, dt: Double, markJump: Bool = false) {
+                let dy = ny - y
+                if dy != 0 { tracker.wheel(deltaY: -Double(dy), precise: true, at: t) }
+                t += dt
+                y = ny
+                guard y >= 0, y + view <= full.height else { return }
+                let active = tracker.active(at: t) && st.acceptedFrames > 0
+                let req = active ? tracker.capture(at: t) : nil
+                if active && req == nil { return }
+                let o = st.add(slice(y, view), expected: req?.expected, tolerance: req?.tolerance ?? 0)
+                if markJump { jumpOutcome = o }
+                if case .shifted(let d) = o, d != 0 {
+                    if let r = req { tracker.placed(d: d, capture: r, edges: st.edgeBands) }
+                    else { tracker.resync() }
+                    tracker.body = max(64, Int((Double(view) * st.movingShare).rounded()))
+                } else if case .lost = o, let r = req {
+                    tracker.lost(r)
+                }
+            }
+            push(y, dt: 0.02)
+            for _ in 0..<12 { push(y + 32, dt: 0.16) }
+            let at = y
+            push(at + 900, dt: 0.05, markJump: true)
+            push(at + 948, dt: 0.30)
+            if let img = st.finish(), let out = PixelFrame(cgImage: img) {
+                let bad = matches(out, docY: hole)
+                check("near-duplicate lines: flick view \(view) does not skip unseen rows",
+                      jumpOutcome == .lost && bad == nil && st.needsRecovery && st.gapFrames > 0,
+                      "jump=\(String(describing: jumpOutcome)) bad=\(bad.map(String.init) ?? "none") h=\(out.height) lost=\(st.lostFrames) gap=\(st.gapFrames) rec=\(st.needsRecovery)")
+            } else {
+                check("near-duplicate lines: flick view \(view)", false, "no image")
+            }
+        }
     }
 
     private static func solid(width w: Int, height h: Int, rgb: (UInt8, UInt8, UInt8), seed: UInt64) -> [UInt8] {

@@ -243,7 +243,7 @@ final class CaptureSession {
         if o == .lost || (recovering && !autoScroll) {
             text = autoScroll
                 ? L("这一下没对上，往回退一点重来 · ", "Lost the place, backing up to retry · ") + text
-                : L("滚过头了，往回滚一点就能接上 · ", "Scrolled too far, scroll back a little to reconnect · ") + text
+                : L("滚过头了，往回滚一点就能接上 · 现在点完成会标成未完成 · ", "Scrolled too far, scroll back a little to reconnect · finishing now marks this capture incomplete · ") + text
         } else if case .shifted(let d) = o, d != 0, !autoScroll {
             text = L("刚接上 · ", "Joined · ") + text
         }
@@ -404,11 +404,16 @@ final class CaptureSession {
                     var rec = base
                     rec.framesStitched = stitcher.acceptedFrames
                     rec.droppedFrames = stitcher.lostFrames
-                    // Ending while a frame could not be placed: what was on screen then is not in the
-                    // result. A frame lost and later reconnected leaves nothing missing.
+                    // A frame that cannot be placed stays out of the image. A later frame is
+                    // written only when the overlap proves those rows continue; a similar
+                    // match that cannot be proved is left unjoined, so lines that were never
+                    // on screen are not skipped. Ending still unjoined records that tail.
+                    // A lost frame that later reconnects on a proved overlap leaves nothing missing.
                     if stitcher.needsRecovery {
                         rec.isPartial = true
                         rec.partialReason = "ended-before-reconnecting"
+                        rec.gaps = [ContentGap(afterRow: image.height, droppedFrames: stitcher.gapFrames,
+                                               reason: "ended-before-reconnecting")]
                     }
                     rec.pixelWidth = image.width
                     rec.pixelHeight = image.height

@@ -95,6 +95,10 @@ final class Stitcher: @unchecked Sendable {
     private(set) var acceptedFrames = 0
     /// Frames that could not be placed and were dropped instead of being pasted in.
     private(set) var lostFrames = 0
+    /// Frames dropped since the last placement that proved the rows continue.
+    /// Cleared when a later frame joins on that proof. While `needsRecovery` is set,
+    /// this is how many frames the tail is missing, not a hole inside the image.
+    private(set) var gapFrames = 0
     /// True while the last frame could not be placed and nothing placed since. If the capture
     /// ends like this, content the user saw is missing from the result: it is partial.
     private(set) var needsRecovery = false
@@ -182,7 +186,7 @@ final class Stitcher: @unchecked Sendable {
         guard let a = analyze(p, frame) else {
             // Identical to the reference: the user is back exactly where the last frame was.
             staticRun += 1
-            needsRecovery = false
+            markJoined()
             return .unchanged
         }
 
@@ -194,7 +198,7 @@ final class Stitcher: @unchecked Sendable {
                 return reject() // it may have moved, to one of several places: neither stitch nor adopt it
             } else {
                 prev = frame
-                needsRecovery = false
+                markJoined()
                 staticRun += 1
                 return .unchanged
             }
@@ -249,7 +253,7 @@ final class Stitcher: @unchecked Sendable {
             prev = frame
             if let f = far, f.origin == prevOrigin { far = (frame, f.origin, f.top) }
             knobs = knobs.filter { $0.key == ObjectIdentifier(frame) || $0.key == ObjectIdentifier(far!.frame) }
-            needsRecovery = false
+            markJoined()
             staticRun += 1
             return .shifted(0)
         }
@@ -260,7 +264,7 @@ final class Stitcher: @unchecked Sendable {
             xOffset += dx
             prev = raw.shiftedLeft(by: xOffset)
             if let f = far, f.origin == prevOrigin { far = (prev!, f.origin, f.top) }
-            needsRecovery = false
+            markJoined()
             staticRun += 1
             return .shifted(0)
         }
@@ -334,7 +338,7 @@ final class Stitcher: @unchecked Sendable {
         prev = frame
         if let f = far, f.origin > origin {} else { far = (frame, origin, a.top) }
         knobs = knobs.filter { $0.key == ObjectIdentifier(frame) || $0.key == ObjectIdentifier(far!.frame) }
-        needsRecovery = false
+        markJoined()
         let band = bottom - a.top
         lastOverlap = Double(band - abs(d)) / Double(max(1, band))
         if d > 0, m.cut == nil {
@@ -348,10 +352,20 @@ final class Stitcher: @unchecked Sendable {
     /// repeat whatever it shares with the canvas, so it is dropped: canvas, reference and
     /// coordinates stay as they were, and scrolling back into overlap picks up from there.
     private func reject() -> Outcome {
+        // A new break starts its own count. Frames already dropped in this break keep adding.
+        if !needsRecovery { gapFrames = 0 }
+        gapFrames += 1
         lostFrames += 1
         needsRecovery = true
         staticRun = 0
         return .lost
+    }
+
+    /// The canvas and the reference agree again. The frames dropped while they did not
+    /// are not a hole in the image: the overlap that just joined already contains them.
+    private func markJoined() {
+        needsRecovery = false
+        gapFrames = 0
     }
 
     /// Whether `rows` of `p` hold detail that sits still on screen in `f`: a button fixed to the
@@ -653,21 +667,31 @@ final class Stitcher: @unchecked Sendable {
         let votes = hashVotes(moving)
 
         let ranked = votes.sorted { $0.value > $1.value }
+        // `verify` can accept a shift of repeating text. `proved` then asks whether the rows
+        // that occur once are the same pixels there. Too few such rows: keep the candidate
+        // and let the distance check below refuse a tie. Enough, and they disagree: drop it.
+        // Dropped candidates are not marked ambiguous, so the wider search can still run.
+        func proved(_ found: [Placement]) -> [Placement] {
+            found.filter { self.proved(p, f, body: body, $0, strips: strips) != false }
+        }
         if let window {
             // Local alignment around the expected shift. Hash candidates first; if none of them
             // holds up, every shift in the window. Two separate places that both line up mean
             // the estimate cannot tell look-alike bubbles apart: reject.
             let lo = max(window.lowerBound, -(body.count - 1)), hi = min(window.upperBound, body.count - 1)
             guard lo <= hi else { return nil }
-            var found = ranked.filter { $0.value >= 3 && (lo...hi).contains($0.key) }
+            let voted = ranked.filter { $0.value >= 3 && (lo...hi).contains($0.key) }
                 .compactMap { verify(p, f, body: body, d: $0.key, strips: strips) }
-            if found.isEmpty { found = (lo...hi).compactMap { verify(p, f, body: body, d: $0, strips: strips) } }
+            var found = proved(voted)
+            if found.isEmpty {
+                found = proved((lo...hi).compactMap { verify(p, f, body: body, d: $0, strips: strips) })
+            }
             guard let best = found.max(by: { (votes[$0.d] ?? 0) < (votes[$1.d] ?? 0) }) else { return nil }
             if found.contains(where: { abs($0.d - best.d) > 2 }) { ambiguous = true; return nil }
             return best
         }
         // Chat bubbles look alike: if two distant shifts both verify, either could be wrong.
-        let verified = ranked.prefix(4).filter { $0.value >= 3 }.compactMap { verify(p, f, body: body, d: $0.key, strips: strips) }
+        let verified = proved(ranked.prefix(4).filter { $0.value >= 3 }.compactMap { verify(p, f, body: body, d: $0.key, strips: strips) })
         if let m = verified.first {
             if verified.contains(where: { abs($0.d - m.d) > 3 }) { ambiguous = true; return nil }
             return m
@@ -677,7 +701,10 @@ final class Stitcher: @unchecked Sendable {
         // fades can make one of them look cheaper than the others.
         let profile = profileSearch(p, f, body: body, a: a)
         if let d = profile.best, let m = verify(p, f, body: body, d: d, strips: strips) {
-            if profile.rivals.contains(where: { verify(p, f, body: body, d: $0, strips: strips) != nil }) { ambiguous = true; return nil }
+            let rivals = profile.rivals.compactMap { verify(p, f, body: body, d: $0, strips: strips) }
+            let keptRivals = proved(rivals)
+            guard proved([m]).count == 1 else { return nil }
+            if keptRivals.contains(where: { abs($0.d - m.d) > 3 }) { ambiguous = true; return nil }
             return m
         }
         return nil
@@ -886,6 +913,37 @@ final class Stitcher: @unchecked Sendable {
     /// to the pixel at shift `d`, and there are plenty of them, on many different rows: a real scroll moves pixels exactly, while
     /// tolerant matching lets smooth areas (a photo, a gradient) line up at shifts near the true one.
     private func exactSupport(_ p: PixelFrame, _ f: PixelFrame, body: Range<Int>, rows band: [Int], d: Int, strips: [Range<Int>]) -> Bool {
+        let c = onceCounts(p, f, body: body, rows: band, d: d, strips: strips)
+        let need = max(2 * minimumOverlap, requiredOverlap(body) / 4)
+        // And spread over many rows: one element that moved on its own (an ad drawn a frame late) can
+        // be pixel-identical at a wrong shift in all its strips, but only over its own few rows.
+        return c.exact >= 2 * minimumOverlap && c.exact * 2 >= c.detailed && c.rows >= need
+    }
+
+    /// nil when the clean band has too few once-only rows to judge, so the caller keeps a
+    /// match that `verify` already accepted. false when there are enough such rows and they
+    /// are not the same pixels at this shift: repeating body text can satisfy `verify` at a
+    /// shift that skips lines the two frames never shared.
+    ///
+    /// The spread floor from `exactSupport` is not reused. A true wheel shift can agree on
+    /// every once-only row it has and still sit under that floor (a short overlap, or the
+    /// unique marks living in one narrow column). Rejecting it dropped the frame, and the
+    /// changes-path then cut a look-alike frame at that same distance. Agreement is the
+    /// proof; a handful of rows is simply not enough evidence to decide.
+    private func proved(_ p: PixelFrame, _ f: PixelFrame, body: Range<Int>, _ m: Placement, strips: [Range<Int>]) -> Bool? {
+        let band = Array(m.cleanTop..<max(m.cleanTop, m.cleanBottom))
+        let c = onceCounts(p, f, body: body, rows: band, d: m.d, strips: strips)
+        let need = max(2 * minimumOverlap, requiredOverlap(body) / 4)
+        if c.detailed < need { return nil }
+        let agreed = c.exact >= 2 * minimumOverlap && c.exact * 2 >= c.detailed
+        // Fewer than eight distinct rows is one widget, not a page of line numbers.
+        // Agreement there is not proof; disagreement still is, so a repeated body
+        // cannot ride a short column of digits that do not line up.
+        if c.rows < minimumOverlap / 2 { return agreed ? nil : false }
+        return agreed
+    }
+
+    private func onceCounts(_ p: PixelFrame, _ f: PixelFrame, body: Range<Int>, rows band: [Int], d: Int, strips: [Range<Int>]) -> (exact: Int, detailed: Int, rows: Int) {
         var exact = 0, detailed = 0
         var exactRows = Set<Int>()
         for s in strips where !band.isEmpty {
@@ -900,9 +958,7 @@ final class Stitcher: @unchecked Sendable {
                 if let b = ph[fy + d - body.lowerBound], a == b, pc[b] == 1 { exact += 1; exactRows.insert(fy) }
             }
         }
-        // And spread over many rows: one element that moved on its own (an ad drawn a frame late) can
-        // be pixel-identical at a wrong shift in all its strips, but only over its own few rows.
-        return exact >= 2 * minimumOverlap && exact * 2 >= detailed && exactRows.count >= max(2 * minimumOverlap, requiredOverlap(body) / 4)
+        return (exact, detailed, exactRows.count)
     }
 
     /// Nothing scrolled, a picture changed in place (an image or an ad loading). The caller rewrites the

@@ -22,10 +22,35 @@ struct CaptureRecord: Codable {
     /// The capture ended while the last frame could not be placed: content is missing at the end.
     var isPartial = false
     var partialReason: String? = nil
+    /// Where the image stops being a continuous capture. Nil, and omitted from JSON, when it does not.
+    var gaps: [ContentGap]? = nil
+}
+
+/// A stretch that was on screen and is not in the image. `afterRow` is the image height:
+/// the missing rows are after the last row that was proved to follow the one above it.
+struct ContentGap: Codable, Equatable {
+    var afterRow: Int
+    var droppedFrames: Int
+    var reason: String
 }
 
 enum Exporter {
-    static let version = "0.1.0"
+    /// Packaged builds read the short version. The command-line self-test has no app
+    /// bundle, and a bare `1.0` from an unrelated bundle is not a release of this app.
+    static func releaseVersion(bundleShort: String?, bundleIdentifier: String?) -> String {
+        let packaged = bundleIdentifier == "io.github.lululynne.livingscrollpdf"
+        if let raw = bundleShort?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            if packaged { return raw }
+            if raw != "1.0" { return raw }
+        }
+        return "dev"
+    }
+
+    static var version: String {
+        releaseVersion(
+            bundleShort: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+            bundleIdentifier: Bundle.main.bundleIdentifier)
+    }
 
     enum PDFLayout: String {
         /// One tall page, like the PNG; split only where a page would exceed the PDF size limit.
