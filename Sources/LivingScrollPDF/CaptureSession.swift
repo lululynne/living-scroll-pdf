@@ -129,8 +129,7 @@ final class CaptureSession {
         // bar) every tick is matched over the full range, as before.
         var request: ManualTracker.Capture?
         if !autoScroll, stitcher.acceptedFrames > 0, let t = tracker, t.active(at: now) {
-            // While a frame could not be joined, the advice to scroll back stays up (`report`).
-            if !recovering { reportGauge(t.gauge) }
+            if recovering { reportRecovery(t) } else { reportGauge(t.gauge) }
             guard let r = tracker?.capture(at: now) else { return }
             request = r
         }
@@ -237,17 +236,39 @@ final class CaptureSession {
         }
     }
 
+    private var lastStats = (height: 0, frames: 0, dropped: 0)
+
     private func report(_ o: Stitcher.Outcome, height: Int, frames: Int, dropped: Int) {
+        lastStats = (height, frames, dropped)
         let shown = max(height, Int(sourceRect.height * CGFloat(scale)))
         var text = L("已收 \(frames) 张 · 长 \(shown) px", "\(frames) taken · \(shown) px tall")
         if o == .lost || (recovering && !autoScroll) {
-            text = autoScroll
-                ? L("这一下没对上，往回退一点重来 · ", "Lost the place, backing up to retry · ") + text
-                : L("滚过头了，往回滚到和上一帧重叠的地方才会接上 · 现在点完成会标成未完成 · ", "Scrolled too far. It joins only after you scroll back over the last frame · finishing now marks this capture incomplete · ") + text
+            if autoScroll {
+                text = L("这一下没对上，往回退一点重来 · ", "Lost the place, backing up to retry · ") + text
+            } else if reportRecovery(tracker) {
+                return
+            } else {
+                text = recoveringFallbackText()
+            }
         } else if case .shifted(let d) = o, d != 0, !autoScroll {
             text = L("刚接上 · ", "Joined · ") + text
         }
         update(text)
+    }
+
+    /// Existing recovering copy: no wheel, or the wheel total is no longer credible.
+    private func recoveringFallbackText() -> String {
+        let shown = max(lastStats.height, Int(sourceRect.height * CGFloat(scale)))
+        let text = L("已收 \(lastStats.frames) 张 · 长 \(shown) px", "\(lastStats.frames) taken · \(shown) px tall")
+        return L("滚过头了，往回滚到和上一帧重叠的地方才会接上 · 现在点完成会标成未完成 · ", "Scrolled too far. It joins only after you scroll back over the last frame · finishing now marks this capture incomplete · ") + text
+    }
+
+    /// Live signed distance while recovering. False = keep the existing sentence, no invented number.
+    @discardableResult
+    private func reportRecovery(_ t: ManualTracker?) -> Bool {
+        guard let t, let text = ManualTracker.recoveryStatusText(t.recovery(at: now)) else { return false }
+        update(text)
+        return true
     }
 
     /// The overlap gauge, in words until the HUD has a bar for it.
@@ -279,12 +300,18 @@ final class CaptureSession {
                 guard region.contains(point), WindowList.frontmost(at: point)?.id == self.pick.windowID else { return }
                 self.noteInput()
                 self.tracker?.wheel(deltaY: dy, precise: precise, at: self.now)
+                if self.recovering { self.reportRecovery(self.tracker) }
             }
         }
         // Keys (arrows, space, page down) and dragging a scroll bar move pages without the wheel.
         // Any of them counts, wherever it happens: wrongly assuming a move only costs leniency.
         inputMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .leftMouseDragged]) { [weak self] _ in
-            MainActor.assumeIsolated { self?.noteInput() }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.noteInput()
+                self.tracker?.invalidateWheel()
+                if self.recovering { self.update(self.recoveringFallbackText()) }
+            }
         }
     }
 
@@ -577,7 +604,10 @@ final class HUDPanel: NSPanel {
         contentView = bg
     }
 
-    func setStatus(_ text: String) { label.stringValue = text }
+    func setStatus(_ text: String) {
+        guard label.stringValue != text else { return }
+        label.stringValue = text
+    }
     func setAuto(_ on: Bool) { autoButton.title = on ? L("停止自动", "Stop") : L("自动滚到底", "Auto-scroll") }
     /// Export has started; nothing on the bar can change the outcome any more.
     func setBusy() { buttons.forEach { $0.isEnabled = false } }

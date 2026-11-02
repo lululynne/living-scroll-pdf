@@ -822,6 +822,8 @@ enum SelfTest {
         // flick past one screen was accepted at shift 132 while the frames shared no rows.
         nearDuplicateLines(check)
 
+        recoveryDistance(check)
+
         // 8. Export round trip.
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("livingscrollpdf-selftest-\(getpid())")
         do {
@@ -867,9 +869,10 @@ enum SelfTest {
                   && Exporter.version != "0.1.0",
                   "cli=\(Exporter.version)")
             let tool = object?["tool"] as? String ?? ""
-            check("exported JSON tool string is the command-line build, not 0.1.0",
-                  tool == "卷轴PDF · Living Scroll PDF dev" && !tool.contains("0.1.0") && Exporter.version == "dev",
-                  tool)
+            let expectedTool = "卷轴PDF · Living Scroll PDF \(Exporter.version)"
+            check("exported JSON tool string matches this build, not 0.1.0",
+                  tool == expectedTool && !tool.contains("0.1.0") && Exporter.version != "0.1.0",
+                  "tool=\(tool) version=\(Exporter.version)")
             print("     output: \(dir.path)")
         } catch {
             check("export", false, "\(error)")
@@ -1051,6 +1054,103 @@ enum SelfTest {
         } else {
             check("near-duplicate lines: scrolling back to a real overlap joins, then downward steps stay exact", false, "no image")
         }
+    }
+
+    /// Signed recovery distance: last placed frame is zero. Display only; not a stitch input.
+    private static func recoveryDistance(_ check: (String, Bool, String) -> Void) {
+        let body = 400
+        func dist(_ estimate: Int, active: Bool = true, credible: Bool = true) -> ManualTracker.RecoveryDistance {
+            ManualTracker.recoveryDistance(estimate: estimate, body: body, wheelActive: active, wheelCredible: credible)
+        }
+        var leaving: [Double] = []
+        for e in [0, 80, 160, 320] {
+            if case .offset(let s) = dist(e) { leaving.append(s) }
+        }
+        check("leaving the break: signed screens grow",
+              leaving == [0.2, 0.4, 0.8],
+              "\(leaving)")
+        check("at the break: arrived, no fake 0.0", dist(0) == .arrived && dist(12) == .arrived, "")
+        check("scrolling back approaches zero",
+              { if case .offset(let a) = dist(320), case .offset(let b) = dist(80) { return a > b && b > 0 }; return false }(), "")
+        check("crossing zero flips the sign",
+              { if case .offset(let a) = dist(80), case .offset(let b) = dist(-80) { return a > 0 && b < 0 }; return false }(), "")
+        check("no wheel: unknown, no number", dist(320, active: false) == .unknown, "")
+        check("keyboard after a jump: unknown, no number", dist(320, credible: false) == .unknown, "")
+
+        let up = ManualTracker.recoveryStatusText(.offset(screens: 3.21))
+        let down = ManualTracker.recoveryStatusText(.offset(screens: -0.84))
+        check("recovery copy: still going up",
+              up == L("约 ↑ +3.2 屏 · 还要往上", "about ↑ +3.2 screens · keep going up"),
+              up ?? "-")
+        check("recovery copy: past zero go down",
+              down == L("约 ↓ -0.8 屏 · 滚过头了往下", "about ↓ -0.8 screens · too far, go down"),
+              down ?? "-")
+        check("recovery copy: arrived is the existing hold-still line",
+              ManualTracker.recoveryStatusText(.arrived) == L("到了，停一下", "There, hold still"), "")
+        check("recovery copy: unknown has no invented number",
+              ManualTracker.recoveryStatusText(.unknown) == nil, "")
+
+        var t = ManualTracker(body: body, pixelScale: 1)
+        t.wheel(deltaY: -200, precise: true, at: 0)
+        guard let first = t.capture(at: 0.4) else {
+            check("recovery tracker: first capture", false, ""); return
+        }
+        t.placed(d: 200, capture: first, edges: (0, 0))
+        let atBreak = t.estimate
+        t.wheel(deltaY: -120, precise: true, at: 1.0)
+        let away = t.estimate
+        let rawAway = t.raw
+        t.lost(first)
+        check("lost keeps the wheel total", t.raw == rawAway && t.estimate == away, "raw=\(t.raw) est=\(t.estimate)")
+        t.wheel(deltaY: -80, precise: true, at: 1.1)
+        let farther = t.estimate
+        t.wheel(deltaY: 160, precise: true, at: 1.2)
+        let back = t.estimate
+        t.wheel(deltaY: 80, precise: true, at: 1.3)
+        let past = t.estimate
+        check("wheel after lost still accumulates",
+              atBreak == 0 && away > atBreak && farther > away && abs(back) < abs(farther) && past < 0,
+              "break=\(atBreak) away=\(away) farther=\(farther) back=\(back) past=\(past)")
+        let rawBeforeRead = t.raw
+        _ = t.recovery(at: 1.3)
+        check("reading the gauge does not move the wheel total", t.raw == rawBeforeRead, "")
+
+        var u = ManualTracker(body: body, pixelScale: 1)
+        check("uncalibrated ratio is 1", u.ratio == 1 && !u.calibrated, "")
+        u.wheel(deltaY: -800, precise: true, at: 0)
+        check("uncalibrated estimate follows raw 1:1", u.estimate == 800 && u.raw == 800, "")
+        if case .offset(let s) = u.recovery(at: 0.1) {
+            check("uncalibrated recovery is still an estimate in screens", abs(s - 2.0) < 0.01, "s=\(s)")
+        } else {
+            check("uncalibrated recovery is still an estimate in screens", false, "\(u.recovery(at: 0.1))")
+        }
+        check("uncalibrated with no recent wheel is unknown", u.recovery(at: 3) == .unknown, "")
+        u.invalidateWheel()
+        check("uncalibrated after keyboard is unknown", u.recovery(at: 0.2) == .unknown, "")
+
+        var inertia = ManualTracker(body: body, pixelScale: 1)
+        var clock = 0.0
+        inertia.wheel(deltaY: -50, precise: true, at: clock)
+        var last = inertia.estimate
+        var grew = true
+        for k in 0..<10 {
+            clock += 0.008
+            inertia.wheel(deltaY: -50 * pow(0.9, Double(k + 1)), precise: true, at: clock)
+            if inertia.estimate <= last { grew = false }
+            last = inertia.estimate
+        }
+        check("inertia deltas are counted in the wheel total", grew && last > 50, "last=\(last)")
+
+        let recLive = t.recovery(at: 1.35)
+        let capWait = t.capture(at: 1.35)
+        check("gauge can update while capture waits",
+              recLive != .unknown && capWait == nil,
+              "recovery=\(recLive) capture=\(String(describing: capWait))")
+        let capStopped = t.capture(at: 1.7)
+        let screens = Double(t.estimate) / Double(body)
+        check("stitch expected is wheel pixels, not HUD screens",
+              capStopped?.expected == t.estimate && abs(Double(capStopped?.expected ?? 0) - screens) > 1,
+              "expected=\(capStopped?.expected.map(String.init) ?? "-") est=\(t.estimate) screens=\(screens)")
     }
 
     private static func solid(width w: Int, height h: Int, rgb: (UInt8, UInt8, UInt8), seed: UInt64) -> [UInt8] {

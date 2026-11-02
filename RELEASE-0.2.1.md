@@ -8,9 +8,9 @@
 
 这时点完成，文件名带「未完成」。同名 JSON 写 `isPartial`、`partialReason` 和 `gaps`。`gaps.afterRow` 是当前图像高度，缺的是结尾之后还没接上的部分，不会在图中间补像素。
 
-导出版本读包里的 `CFBundleShortVersionString`。命令行构建没有 app 包，记为 `dev`，不再写成 `0.1.0`。打包脚本里的版本是 `0.2.1`，build `3`。
+导出版本读包里的 `CFBundleShortVersionString`。命令行构建没有 app 包，记为 `dev`，不再写成 `0.1.0`。打包脚本里的版本是 `0.2.1`，build `4`。
 
-往回滚、停下、速度不匀都可以，只要新的一帧还能和上一帧对上真实重叠。滚过了重叠范围，就得滚回到还重叠的位置才会再接上。
+往回滚、停下、速度不匀都可以，只要新的一帧还能和上一帧对上真实重叠。滚过了重叠范围，就得滚回到还重叠的位置才会再接上。恢复状态下，滚轮累计会在提示条上显示离断点大约多少屏，零点是断开的那一帧；没有滚轮不编数字。是否接上仍只由连续性校验决定。打包 app 内的 selftest 不再把正确的导出版本误报成失败。
 
 ## 已知限制
 
@@ -30,9 +30,9 @@ Near-duplicate lines (a repeating body plus one narrow unique column) are no lon
 
 Finishing then writes the unfinished mark on the file name. The JSON records `isPartial`, `partialReason` and `gaps`. `gaps.afterRow` is the current image height: the gap is after the end, and no pixels are invented in the middle.
 
-The export version is `CFBundleShortVersionString`. A command-line build has no app bundle and is recorded as `dev`, not `0.1.0`. The pack script stamps `0.2.1`, build `3`.
+The export version is `CFBundleShortVersionString`. A command-line build has no app bundle and is recorded as `dev`, not `0.1.0`. The pack script stamps `0.2.1`, build `4`.
 
-Scrolling back, pausing and uneven speed are fine when the new frame still overlaps the previous one. Past that overlap, it joins again only after you scroll back to a real overlap.
+Scrolling back, pausing and uneven speed are fine when the new frame still overlaps the previous one. Past that overlap, it joins again only after you scroll back to a real overlap. While recovering, the status bar shows an approximate signed distance in screens from the break; without wheel events it does not invent a number. Joining is still decided only by the continuity check. Self-test inside a packaged app no longer fails on a correct export version.
 
 ## Limits
 

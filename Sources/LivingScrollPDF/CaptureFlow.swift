@@ -158,6 +158,9 @@ struct ManualTracker {
     /// Last frame taken while past `maxShift`.
     private var lastLook = -Double.infinity
     private var edges = (top: 0, bottom: 0)
+    /// Keyboard or scrollbar movement since the last placed frame: the wheel total no longer
+    /// matches the page, so a recovery number would be invented.
+    private var wheelCredible = true
 
     init(body: Int, pixelScale: Int) {
         self.body = body
@@ -232,13 +235,62 @@ struct ManualTracker {
         // What the wheel moved after the frame was taken carries over to the next one.
         raw -= Double(d) / ratio
         windowMisses = 0
+        wheelCredible = true
         edges = (min(body / 5, newEdges.top), min(body / 5, newEdges.bottom))
     }
 
     mutating func lost(_ capture: Capture) {
         if capture.expected != nil { windowMisses += 1 }
+        // `raw` keeps running: the last placed frame is still the origin, and later wheel
+        // events (inertia included) stay on the same total. Recovery copy reads that total;
+        // it is never fed back into capture() or the stitcher.
     }
 
+    /// Keys or dragging a scroll bar moved the page without a wheel event.
+    mutating func invalidateWheel() { wheelCredible = false }
+
     /// A frame was placed outside wheel control (keyboard, scroll bar): start counting afresh.
-    mutating func resync() { raw = 0 }
+    mutating func resync() {
+        raw = 0
+        wheelCredible = true
+    }
+
+    /// Signed distance from the last placed frame, in screens of `body`. Positive is later
+    /// content (still need to go up); negative is earlier (past the break, go down). Nil-origin
+    /// copy is `.unknown` when there is no credible wheel.
+    enum RecoveryDistance: Equatable {
+        case unknown
+        case arrived
+        case offset(screens: Double)
+    }
+
+    /// Closer than this, the bar says hold still instead of printing 0.0.
+    static let arrivedScreens = 0.05
+
+    static func recoveryDistance(estimate: Int, body: Int, wheelActive: Bool, wheelCredible: Bool) -> RecoveryDistance {
+        guard wheelActive, wheelCredible else { return .unknown }
+        let screens = Double(estimate) / Double(max(1, body))
+        if abs(screens) < arrivedScreens { return .arrived }
+        return .offset(screens: screens)
+    }
+
+    func recovery(at t: Double) -> RecoveryDistance {
+        Self.recoveryDistance(estimate: estimate, body: body, wheelActive: active(at: t), wheelCredible: wheelCredible)
+    }
+
+    /// Status-bar copy. `.unknown` is nil so the caller keeps the existing recovering sentence.
+    static func recoveryStatusText(_ d: RecoveryDistance) -> String? {
+        switch d {
+        case .unknown:
+            return nil
+        case .arrived:
+            return L("到了，停一下", "There, hold still")
+        case .offset(let screens):
+            let n = String(format: "%+.1f", screens)
+            if screens > 0 {
+                return L("约 ↑ \(n) 屏 · 还要往上", "about ↑ \(n) screens · keep going up")
+            }
+            return L("约 ↓ \(n) 屏 · 滚过头了往下", "about ↓ \(n) screens · too far, go down")
+        }
+    }
 }
