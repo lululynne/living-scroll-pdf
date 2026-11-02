@@ -35,8 +35,9 @@ struct ContentGap: Codable, Equatable {
 }
 
 enum Exporter {
-    /// Packaged builds read the short version. The command-line self-test has no app
-    /// bundle, and a bare `1.0` from an unrelated bundle is not a release of this app.
+    /// A packaged app records CFBundleShortVersionString. `dev` is only the command-line
+    /// binary, which has no app bundle; it must not be written up as 0.1.0. A bare `1.0`
+    /// from an unrelated bundle is not a release of this app either.
     static func releaseVersion(bundleShort: String?, bundleIdentifier: String?) -> String {
         let packaged = bundleIdentifier == "io.github.lululynne.livingscrollpdf"
         if let raw = bundleShort?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {

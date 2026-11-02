@@ -818,9 +818,8 @@ enum SelfTest {
                   PixelFrame(width: w, height: header + bodyH + footer, bytes: b).reachesOutsideWindow && !frame(offset: 0, cursor: false).reachesOutsideWindow)
         }
 
-        // Near-duplicate text lines from the 2026-11-02 TextEdit capture. The body repeats
-        // every 16px and only the line numbers differ. Before the proof gate, a manual flick
-        // past one screen was accepted at shift 132 while the frames shared no rows.
+        // Periodic lines, unique only in a narrow column. Before the proof gate, a manual
+        // flick past one screen was accepted at shift 132 while the frames shared no rows.
         nearDuplicateLines(check)
 
         // 8. Export round trip.
@@ -860,12 +859,17 @@ enum SelfTest {
                   "\(String(describing: gapList))")
             check("version comes from the bundle, not a hard-coded 0.1.0",
                   Exporter.releaseVersion(bundleShort: "0.2.0", bundleIdentifier: "io.github.lululynne.livingscrollpdf") == "0.2.0"
+                  && Exporter.releaseVersion(bundleShort: "0.2.1", bundleIdentifier: "io.github.lululynne.livingscrollpdf") == "0.2.1"
                   && Exporter.releaseVersion(bundleShort: "1.0", bundleIdentifier: "io.github.lululynne.livingscrollpdf") == "1.0"
                   && Exporter.releaseVersion(bundleShort: nil, bundleIdentifier: nil) == "dev"
                   && Exporter.releaseVersion(bundleShort: "1.0", bundleIdentifier: "other") == "dev"
                   && Exporter.releaseVersion(bundleShort: "  ", bundleIdentifier: nil) == "dev"
                   && Exporter.version != "0.1.0",
                   "cli=\(Exporter.version)")
+            let tool = object?["tool"] as? String ?? ""
+            check("exported JSON tool string is the command-line build, not 0.1.0",
+                  tool == "卷轴PDF · Living Scroll PDF dev" && !tool.contains("0.1.0") && Exporter.version == "dev",
+                  tool)
             print("     output: \(dir.path)")
         } catch {
             check("export", false, "\(error)")
@@ -919,25 +923,15 @@ enum SelfTest {
         return bytes
     }
 
-    /// TextEdit lines that repeat except for the line number (capture 2026-11-02).
-    /// A manual flick past one screen used to be accepted at a false small shift.
+    /// Periodic lines with one unique narrow column. Six planted rows make a
+    /// non-overlapping pair verify at shift 132. See `NearDuplicateFixture`.
     private static func nearDuplicateLines(_ check: (String, Bool, String) -> Void) {
-        let path = "/Users/lulu/Desktop/卷轴PDF/卷轴PDF-文字編輯-20261102-195435-未完成.png"
-        guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
-              let image = CGImageSourceCreateImageAtIndex(src, 0, nil),
-              let full = PixelFrame(cgImage: image) else {
-            check("near-duplicate lines: field image", false, "load failed \(path)")
-            return
-        }
-        let hole = 63 * 16
+        let full = NearDuplicateFixture.make()
+        let hole = NearDuplicateFixture.hole
+        let yP = NearDuplicateFixture.placedY
+        let yF = NearDuplicateFixture.jumpedY
         let rb = full.width * 4
-        func slice(_ y: Int, _ h: Int) -> PixelFrame {
-            var bytes = [UInt8](repeating: 255, count: h * rb)
-            for row in 0..<h {
-                bytes.replaceSubrange(row * rb..<(row + 1) * rb, with: full.bytes[(y + row) * rb..<(y + row + 1) * rb])
-            }
-            return PixelFrame(width: full.width, height: h, bytes: bytes)
-        }
+        func slice(_ y: Int, _ h: Int) -> PixelFrame { NearDuplicateFixture.slice(full, y, h) }
         func matches(_ out: PixelFrame, docY: Int) -> Int? {
             guard docY >= 0, docY + out.height <= full.height else { return -2 }
             for r in 0..<out.height where out.bytes[r * rb..<(r + 1) * rb] != full.bytes[(docY + r) * rb..<(docY + r + 1) * rb] {
@@ -962,7 +956,7 @@ enum SelfTest {
             check("near-duplicate lines: small steps stay exact", false, "no image")
         }
 
-        // Lines 40...63 against lines 94...117: the two sides of the field hole share no rows.
+        // Same phase, no shared rows: the two sides of a hole must not be joined.
         let isolated = Stitcher()
         _ = isolated.add(slice(hole - view, view))
         let across = isolated.add(slice(hole, view))
@@ -1010,6 +1004,52 @@ enum SelfTest {
             } else {
                 check("near-duplicate lines: flick view \(view)", false, "no image")
             }
+        }
+
+        // Keyboard and drag never produce a wheel estimate, so the search has no expected shift.
+        let keyboard = Stitcher()
+        _ = keyboard.add(slice(yP, 384))
+        let typed = keyboard.add(slice(yF, 384), expected: nil, tolerance: 0)
+        check("near-duplicate lines: keyboard or drag with no expected does not join",
+              typed == .lost && keyboard.needsRecovery && keyboard.gapFrames == 1 && keyboard.lostFrames == 1,
+              "\(typed) recovering=\(keyboard.needsRecovery) gap=\(keyboard.gapFrames) lost=\(keyboard.lostFrames)")
+
+        let wrong = Stitcher()
+        _ = wrong.add(slice(yP, 384))
+        let off = wrong.add(slice(yF, 384), expected: 48, tolerance: 8)
+        check("near-duplicate lines: a wrong expected shift does not join",
+              off == .lost && wrong.needsRecovery && wrong.gapFrames == 1 && wrong.lostFrames == 1,
+              "\(off) recovering=\(wrong.needsRecovery) gap=\(wrong.gapFrames)")
+
+        let named = Stitcher()
+        _ = named.add(slice(yP, 384))
+        let falseShift = named.add(slice(yF, 384), expected: 132, tolerance: 0)
+        check("near-duplicate lines: the false small shift is not accepted as the expected",
+              falseShift == .lost && named.needsRecovery && named.gapFrames == 1 && named.lostFrames == 1,
+              "\(falseShift) recovering=\(named.needsRecovery) gap=\(named.gapFrames)")
+
+        // After the miss, a frame that really overlaps the kept reference joins, and later
+        // downward steps with no estimate stay on the document.
+        let back = Stitcher()
+        _ = back.add(slice(yP, 384))
+        let missed = back.add(slice(yF, 384), expected: nil, tolerance: 0)
+        let rejoined = back.add(slice(yP + 64, 384), expected: nil, tolerance: 0)
+        var downOK = true
+        var downDetail = ""
+        var downY = yP + 64
+        for _ in 0..<4 {
+            downY += 32
+            let step = back.add(slice(downY, 384), expected: nil, tolerance: 0)
+            if step != .shifted(32) { downOK = false; downDetail = "\(step) at \(downY)"; break }
+        }
+        if let img = back.finish(), let out = PixelFrame(cgImage: img) {
+            let bad = matches(out, docY: yP)
+            check("near-duplicate lines: scrolling back to a real overlap joins, then downward steps stay exact",
+                  missed == .lost && rejoined == .shifted(64) && downOK && bad == nil
+                  && !back.needsRecovery && back.gapFrames == 0 && back.lostFrames == 1,
+                  "missed=\(missed) rejoin=\(rejoined) down=\(downOK) \(downDetail) bad=\(bad.map(String.init) ?? "none") gap=\(back.gapFrames) lost=\(back.lostFrames) h=\(out.height)")
+        } else {
+            check("near-duplicate lines: scrolling back to a real overlap joins, then downward steps stay exact", false, "no image")
         }
     }
 

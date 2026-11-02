@@ -243,7 +243,7 @@ final class CaptureSession {
         if o == .lost || (recovering && !autoScroll) {
             text = autoScroll
                 ? L("这一下没对上，往回退一点重来 · ", "Lost the place, backing up to retry · ") + text
-                : L("滚过头了，往回滚一点就能接上 · 现在点完成会标成未完成 · ", "Scrolled too far, scroll back a little to reconnect · finishing now marks this capture incomplete · ") + text
+                : L("滚过头了，往回滚到和上一帧重叠的地方才会接上 · 现在点完成会标成未完成 · ", "Scrolled too far. It joins only after you scroll back over the last frame · finishing now marks this capture incomplete · ") + text
         } else if case .shifted(let d) = o, d != 0, !autoScroll {
             text = L("刚接上 · ", "Joined · ") + text
         }
@@ -260,7 +260,7 @@ final class CaptureSession {
         case .approaching, .ready:
             update(L("到了，停一下", "There, hold still"))
         case .over:
-            update(L("滚过头了，往回滚一点", "Too far, scroll back a little"))
+            update(L("滚过头了，往回滚到还重叠的位置", "Too far, scroll back until the screens overlap"))
         }
     }
 
