@@ -38,6 +38,12 @@ final class CaptureSession {
     private var inputSeen = false
     /// The last frame could not be joined and nothing has been joined since.
     private var recovering = false
+    /// Memory for the one status line. The session does not choose the sentence.
+    private var hudHold = ManualTracker.HUDHold()
+    /// Errors stay until a frame is judged after `urgentUntil`. The stats line must not cover them.
+    private var urgentStatus: String?
+    /// Frames arrive every tick, so a notice needs a minimum time on the bar or nobody can read it.
+    private var urgentUntil = -Double.infinity
     private let clock0 = Date()
     private var now: Double { Date().timeIntervalSince(clock0) }
     private var captureFailures = 0
@@ -128,10 +134,17 @@ final class CaptureSession {
         // user stopped short of it). Without recent wheel events (keyboard, dragging the scroll
         // bar) every tick is matched over the full range, as before.
         var request: ManualTracker.Capture?
-        if !autoScroll, stitcher.acceptedFrames > 0, let t = tracker, t.active(at: now) {
-            if recovering { reportRecovery(t) } else { reportGauge(t.gauge) }
-            guard let r = tracker?.capture(at: now) else { return }
-            request = r
+        if !autoScroll, stitcher.acceptedFrames > 0, let t = tracker {
+            // The bar and the decision to take a frame are separate. A quiet wheel still
+            // redraws, so a dwell can expire and a recovery distance is not replaced later
+            // by a different sentence. Capture itself still waits for a live wheel.
+            if t.active(at: now) || recovering || hudHold.dwells(at: now) {
+                publishHUD(lost: false, nonzeroShift: false)
+            }
+            if t.active(at: now) {
+                guard let r = tracker?.capture(at: now) else { return }
+                request = r
+            }
         }
         let auto = autoScroll
         // The region follows the window if it is moved.
@@ -146,7 +159,7 @@ final class CaptureSession {
                 captureFailures += 1
                 if captureFailures == 25, !finishing { // about three seconds of failures
                     stopAuto()
-                    update(L("截不到画面了（\(error.localizedDescription)）· 点完成可保存已截的部分", "Can't capture the window (\(error.localizedDescription)) · press Done to save what you have"))
+                    showUrgent(L("截不到画面了（\(error.localizedDescription)）· 点完成可保存已截的部分", "Can't capture the window (\(error.localizedDescription)) · press Done to save what you have"))
                 }
                 return
             }
@@ -159,7 +172,7 @@ final class CaptureSession {
             // it is not the picked region, so it is neither stitched nor counted as lost.
             if frame.reachesOutsideWindow {
                 inFlight = false
-                update(L("截取区域跑到窗口外面了，这一张不拼 · 把窗口挪回原处或点完成", "The capture area is outside the window, this frame is skipped · move the window back or press Done"))
+                showUrgent(L("截取区域跑到窗口外面了，这一张不拼 · 把窗口挪回原处或点完成", "The capture area is outside the window, this frame is skipped · move the window back or press Done"))
                 return
             }
             if tracker == nil {
@@ -185,7 +198,7 @@ final class CaptureSession {
                     inFlight = false
                     settler.reset()
                     stopAuto()
-                    update(L("画面一直在动，停不稳，自动已暂停 · 等它安静下来再点自动，或点完成保存已收的部分", "The picture keeps moving, auto-scroll paused · press Auto again once it settles, or Done to keep what you have"))
+                    showUrgent(L("画面一直在动，停不稳，自动已暂停 · 等它安静下来再点自动，或点完成保存已收的部分", "The picture keeps moving, auto-scroll paused · press Auto again once it settles, or Done to keep what you have"))
                     return
                 case .ready:
                     settler.reset()
@@ -228,9 +241,9 @@ final class CaptureSession {
                 scrollOnce(by: fraction)
             case .pause:
                 stopAuto()
-                update(L("这一段一直对不上，自动已暂停 · 可以手动往回滚一点再点自动，或点完成保存已收的部分", "This part keeps failing to line up, auto-scroll paused · scroll back a little and press Auto again, or press Done to keep what you have"))
+                showUrgent(L("这一段一直对不上，自动已暂停 · 可以手动往回滚一点再点自动，或点完成保存已收的部分", "This part keeps failing to line up, auto-scroll paused · scroll back a little and press Auto again, or press Done to keep what you have"))
             case .finish:
-                update(L("到底了，正在生成…", "Reached the end, saving…"))
+                showUrgent(L("到底了，正在生成…", "Reached the end, saving…"))
                 finish()
             }
         }
@@ -240,49 +253,38 @@ final class CaptureSession {
 
     private func report(_ o: Stitcher.Outcome, height: Int, frames: Int, dropped: Int) {
         lastStats = (height, frames, dropped)
-        let shown = max(height, Int(sourceRect.height * CGFloat(scale)))
-        var text = L("已收 \(frames) 张 · 长 \(shown) px", "\(frames) taken · \(shown) px tall")
-        if o == .lost || (recovering && !autoScroll) {
-            if autoScroll {
-                text = L("这一下没对上，往回退一点重来 · ", "Lost the place, backing up to retry · ") + text
-            } else if reportRecovery(tracker) {
-                return
-            } else {
-                text = recoveringFallbackText()
-            }
-        } else if case .shifted(let d) = o, d != 0, !autoScroll {
-            text = L("刚接上 · ", "Joined · ") + text
-        }
+        // A judged frame means the previous error (missed capture, region off-window) is over.
+        if now >= urgentUntil { urgentStatus = nil }
+        let nonzero: Bool
+        if case .shifted(let d) = o { nonzero = d != 0 } else { nonzero = false }
+        publishHUD(lost: o == .lost, nonzeroShift: nonzero)
+    }
+
+    /// Errors outrank the stats line and the gauge. At least four seconds, then `report` clears them.
+    private func showUrgent(_ text: String) {
+        urgentStatus = text
+        urgentUntil = now + 4
         update(text)
     }
 
-    /// Existing recovering copy: no wheel, or the wheel total is no longer credible.
-    private func recoveringFallbackText() -> String {
+    /// One sentence for the bar. Wheel events, ticks and finished frames all come through here.
+    private func publishHUD(lost: Bool, nonzeroShift: Bool) {
         let shown = max(lastStats.height, Int(sourceRect.height * CGFloat(scale)))
-        let text = L("已收 \(lastStats.frames) 张 · 长 \(shown) px", "\(lastStats.frames) taken · \(shown) px tall")
-        return L("滚过头了，往回滚到和上一帧重叠的地方才会接上 · 现在点完成会标成未完成 · ", "Scrolled too far. It joins only after you scroll back over the last frame · finishing now marks this capture incomplete · ") + text
-    }
-
-    /// Live signed distance while recovering. False = keep the existing sentence, no invented number.
-    @discardableResult
-    private func reportRecovery(_ t: ManualTracker?) -> Bool {
-        guard let t, let text = ManualTracker.recoveryStatusText(t.recovery(at: now)) else { return false }
-        update(text)
-        return true
-    }
-
-    /// The overlap gauge, in words until the HUD has a bar for it.
-    private func reportGauge(_ g: ManualTracker.Gauge) {
-        let scalePx = max(1, stitcher.pixelScale)
-        switch g {
-        case .idle: break
-        case .approaching(let rows) where rows > (tracker?.body ?? 0) / 10:
-            update(L("再往下滚 \(rows / scalePx) 点就拍下一张", "\(rows / scalePx) pt more and the next frame is taken"))
-        case .approaching, .ready:
-            update(L("到了，停一下", "There, hold still"))
-        case .over:
-            update(L("滚过头了，往回滚到还重叠的位置", "Too far, scroll back until the screens overlap"))
-        }
+        let input = ManualTracker.HUDInput(
+            now: now,
+            recovering: recovering,
+            autoScroll: autoScroll,
+            lost: lost,
+            nonzeroShift: nonzeroShift,
+            wheelCredible: tracker?.wheelCredible ?? true,
+            wheelSeen: tracker?.wheelSeen ?? false,
+            distance: tracker?.recovery(at: now) ?? .unknown,
+            gauge: tracker?.gauge ?? .idle,
+            frames: lastStats.frames,
+            shownPx: shown,
+            urgent: urgentStatus
+        )
+        update(ManualTracker.hudLine(input, hold: &hudHold))
     }
 
     /// Wheel and trackpad events (inertia included) over the picked region of the target window.
@@ -300,7 +302,15 @@ final class CaptureSession {
                 guard region.contains(point), WindowList.frontmost(at: point)?.id == self.pick.windowID else { return }
                 self.noteInput()
                 self.tracker?.wheel(deltaY: dy, precise: precise, at: self.now)
-                if self.recovering { self.reportRecovery(self.tracker) }
+                // Distance figures follow the wheel itself, not the next captured frame.
+                // `.over` does too: the dwell starts when the wheel crosses the line.
+                if let t = self.tracker {
+                    let tooFar: Bool
+                    if case .over = t.gauge { tooFar = true } else { tooFar = false }
+                    if self.recovering || tooFar || self.hudHold.dwells(at: self.now) {
+                        self.publishHUD(lost: false, nonzeroShift: false)
+                    }
+                }
             }
         }
         // Keys (arrows, space, page down) and dragging a scroll bar move pages without the wheel.
@@ -310,7 +320,7 @@ final class CaptureSession {
                 guard let self else { return }
                 self.noteInput()
                 self.tracker?.invalidateWheel()
-                if self.recovering { self.update(self.recoveringFallbackText()) }
+                if self.recovering { self.publishHUD(lost: false, nonzeroShift: false) }
             }
         }
     }
@@ -334,12 +344,12 @@ final class CaptureSession {
             return
         }
         guard Self.autoModeAvailable else {
-            update(L("自动滚动随付费版开放，手动滚动一直免费 · scroll.mymomentsmaker.com", "Auto-scroll comes with the paid version; manual scrolling stays free · scroll.mymomentsmaker.com"))
+            showUrgent(L("自动滚动随付费版开放，手动滚动一直免费 · scroll.mymomentsmaker.com", "Auto-scroll comes with the paid version; manual scrolling stays free · scroll.mymomentsmaker.com"))
             return
         }
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         guard AXIsProcessTrustedWithOptions(opts) else {
-            update(L("自动滚动要先在 系统设置 › 隐私与安全性 › 辅助功能 里打开卷轴PDF", "Auto-scroll needs Living Scroll PDF turned on in System Settings › Privacy & Security › Accessibility"))
+            showUrgent(L("自动滚动要先在 系统设置 › 隐私与安全性 › 辅助功能 里打开卷轴PDF", "Auto-scroll needs Living Scroll PDF turned on in System Settings › Privacy & Security › Accessibility"))
             return
         }
         bringTargetToFront()
@@ -373,7 +383,7 @@ final class CaptureSession {
         // Never scroll whatever happens to be on top: the wheel goes to the window under the point.
         guard WindowList.frontmost(at: point)?.id == pick.windowID else {
             stopAuto()
-            update(L("目标窗口被别的窗口挡住了，自动滚动已暂停——挪开后再点一次", "Another window is covering the target, auto-scroll paused. Move it away and press again"))
+            showUrgent(L("目标窗口被别的窗口挡住了，自动滚动已暂停——挪开后再点一次", "Another window is covering the target, auto-scroll paused. Move it away and press again"))
             return
         }
         let step = Int32((max(40, sourceRect.height * 0.45) * fraction).rounded())
@@ -580,7 +590,7 @@ final class HUDPanel: NSPanel {
         bg.layer?.cornerRadius = 12
         bg.layer?.masksToBounds = true
 
-        label.font = .systemFont(ofSize: 13, weight: .medium)
+        label.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium)
         label.textColor = .labelColor
         label.lineBreakMode = .byTruncatingTail
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)

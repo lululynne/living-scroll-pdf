@@ -160,7 +160,7 @@ struct ManualTracker {
     private var edges = (top: 0, bottom: 0)
     /// Keyboard or scrollbar movement since the last placed frame: the wheel total no longer
     /// matches the page, so a recovery number would be invented.
-    private var wheelCredible = true
+    private(set) var wheelCredible = true
 
     init(body: Int, pixelScale: Int) {
         self.body = body
@@ -185,6 +185,9 @@ struct ManualTracker {
 
     /// The wheel was used within the last two seconds: manual mode is wheel-driven right now.
     func active(at t: Double) -> Bool { t - lastWheel < 2 }
+
+    /// A wheel event has been counted. Going quiet does not clear it; keys never set it.
+    var wheelSeen: Bool { lastWheel.isFinite }
 
     mutating func wheel(deltaY: Double, precise: Bool, at t: Double) {
         // Negative deltaY scrolls towards later content, which moves the content up (d > 0).
@@ -291,6 +294,151 @@ struct ManualTracker {
                 return L("约 ↑ \(n) 屏 · 还要往上", "about ↑ \(n) screens · keep going up")
             }
             return L("约 ↓ \(n) 屏 · 滚过头了往下", "about ↓ \(n) screens · too far, go down")
+        }
+    }
+
+    /// How long `.over` stays up once it appears, so a stats write cannot flicker it off.
+    static let overDwell = 0.8
+    /// How long the one-shot rejoin line stays up.
+    static let joinedDwell = 1.5
+
+    /// What the bar is allowed to remember between calls. The session keeps one of these;
+    /// it does not choose the sentence itself.
+    struct HUDHold: Equatable {
+        var overUntil = -Double.infinity
+        var overLatched = false
+        var joinedUntil = -Double.infinity
+        /// Stays set through `joinedUntil`, and clears on the call that ends the line.
+        /// A pure `now < joinedUntil` check would skip that call, so a quiet wheel would
+        /// leave "接上了" on the bar.
+        var joinedLatched = false
+        var wasRecovering = false
+        var arrivedLatched = false
+        /// Last distance sentence while recovering. A quiet wheel keeps it.
+        var lastDistanceText: String? = nil
+
+        func dwells(at _: Double) -> Bool { overLatched || joinedLatched }
+    }
+
+    struct HUDInput: Equatable {
+        var now: Double
+        var recovering: Bool
+        var autoScroll: Bool = false
+        var lost: Bool = false
+        /// Measured shift was nonzero. Manual copy does not prefix on this; both kinds of
+        /// frame stay on the same line.
+        var nonzeroShift: Bool = false
+        var wheelCredible: Bool = true
+        var wheelSeen: Bool = false
+        var distance: RecoveryDistance = .unknown
+        var gauge: Gauge = .idle
+        var frames: Int
+        var shownPx: Int
+        /// Capture, geometry and auto-pause errors. Shown as-is; holds do not move under them.
+        var urgent: String? = nil
+    }
+
+    static func captureStats(frames: Int, shownPx: Int) -> String {
+        L("已收 \(frames) 张 · 长 \(shownPx) px", "\(frames) taken · \(shownPx) px tall")
+    }
+
+    static func recoveringFallback(frames: Int, shownPx: Int) -> String {
+        let text = captureStats(frames: frames, shownPx: shownPx)
+        return L("滚过头了，往回滚到和上一帧重叠的地方才会接上 · 现在点完成会标成未完成 · ", "Scrolled too far. It joins only after you scroll back over the last frame · finishing now marks this capture incomplete · ") + text
+    }
+
+    /// Manual (and auto) status line.
+    ///
+    /// Approaching / ready used to be rewritten every tick, and every moved frame added
+    /// "刚接上", so the bar flickered. Those are gone. `.over` stays at least `overDwell`
+    /// seconds. "接上了" is only the falling edge of `recovering`, held `joinedDwell`
+    /// seconds. While recovering the bar is the signed distance: a wheel that goes quiet
+    /// keeps the last sentence, and only a non-credible wheel — or no wheel at all — uses
+    /// the long sentence. "到了" latches until the distance is past twice `arrivedScreens`.
+    static func hudLine(_ input: HUDInput, hold: inout HUDHold) -> String {
+        if let urgent = input.urgent { return urgent }
+        let stats = captureStats(frames: input.frames, shownPx: input.shownPx)
+        if input.autoScroll {
+            if input.lost {
+                return L("这一下没对上，往回退一点重来 · ", "Lost the place, backing up to retry · ") + stats
+            }
+            return stats
+        }
+        let showJoined = noteJoined(input, hold: &hold)
+        if input.recovering { return recoveryLine(input, stats: stats, hold: &hold) }
+        let showOver = noteOver(input, hold: &hold)
+        if showJoined { return L("接上了 · ", "Joined · ") + stats }
+        if showOver {
+            return L("滚过头了，往回滚到还重叠的位置", "Too far, scroll back until the screens overlap")
+        }
+        return stats
+    }
+
+    /// Falling edge of recovery: one "接上了", then the clock. Later frames do not restart it.
+    private static func noteJoined(_ input: HUDInput, hold: inout HUDHold) -> Bool {
+        if hold.wasRecovering && !input.recovering {
+            hold.joinedUntil = input.now + joinedDwell
+            hold.joinedLatched = true
+            hold.lastDistanceText = nil
+            hold.arrivedLatched = false
+        }
+        hold.wasRecovering = input.recovering
+        if hold.joinedLatched && input.now >= hold.joinedUntil {
+            hold.joinedLatched = false
+        }
+        return !input.recovering && hold.joinedLatched
+    }
+
+    /// `.over` is level-triggered, plus a minimum dwell after it first appears.
+    private static func noteOver(_ input: HUDInput, hold: inout HUDHold) -> Bool {
+        let gaugeOver: Bool
+        if case .over = input.gauge { gaugeOver = true } else { gaugeOver = false }
+        if gaugeOver {
+            if !hold.overLatched {
+                hold.overLatched = true
+                hold.overUntil = input.now + overDwell
+            }
+        } else if input.now >= hold.overUntil {
+            hold.overLatched = false
+        }
+        return hold.overLatched && (gaugeOver || input.now < hold.overUntil)
+    }
+
+    private static func recoveryLine(_ input: HUDInput, stats: String, hold: inout HUDHold) -> String {
+        let fallback = recoveringFallback(frames: input.frames, shownPx: input.shownPx)
+        // Keys and the scroll bar move the page off the wheel total. A number there would be invented.
+        // No wheel at all is the same sentence: there is no distance to keep.
+        if !input.wheelCredible {
+            hold.lastDistanceText = nil
+            hold.arrivedLatched = false
+            return fallback
+        }
+        if !input.wheelSeen { return fallback }
+        if let text = distanceSentence(input.distance, hold: &hold) {
+            hold.lastDistanceText = text
+            return text
+        }
+        // Wheel went quiet (`active` is false, so the distance is `.unknown`). Keep the last figure.
+        if let last = hold.lastDistanceText { return last }
+        return fallback
+    }
+
+    /// "到了" enters under `arrivedScreens` and leaves only past twice that, so the boundary does not chatter.
+    private static func distanceSentence(_ distance: RecoveryDistance, hold: inout HUDHold) -> String? {
+        switch distance {
+        case .unknown:
+            return nil
+        case .arrived:
+            hold.arrivedLatched = true
+            return recoveryStatusText(.arrived)
+        case .offset(let screens):
+            if hold.arrivedLatched {
+                if abs(screens) > arrivedScreens * 2 { hold.arrivedLatched = false }
+            } else if abs(screens) < arrivedScreens {
+                hold.arrivedLatched = true
+            }
+            if hold.arrivedLatched { return recoveryStatusText(.arrived) }
+            return recoveryStatusText(.offset(screens: screens))
         }
     }
 }

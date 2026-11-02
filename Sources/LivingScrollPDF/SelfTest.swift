@@ -823,6 +823,7 @@ enum SelfTest {
         nearDuplicateLines(check)
 
         recoveryDistance(check)
+        hudStability(check)
 
         // 8. Export round trip.
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("livingscrollpdf-selftest-\(getpid())")
@@ -1151,6 +1152,188 @@ enum SelfTest {
         check("stitch expected is wheel pixels, not HUD screens",
               capStopped?.expected == t.estimate && abs(Double(capStopped?.expected ?? 0) - screens) > 1,
               "expected=\(capStopped?.expected.map(String.init) ?? "-") est=\(t.estimate) screens=\(screens)")
+    }
+
+    /// Manual status line: one stable sentence, with the holds the bar used to flicker through.
+    private static func hudStability(_ check: (String, Bool, String) -> Void) {
+        let frames = 4
+        let shown = 2400
+        let stats = ManualTracker.captureStats(frames: frames, shownPx: shown)
+        let joinedLine = L("接上了 · ", "Joined · ") + stats
+        let overLine = L("滚过头了，往回滚到还重叠的位置", "Too far, scroll back until the screens overlap")
+        let arrivedLine = ManualTracker.recoveryStatusText(.arrived) ?? ""
+        let fallback = ManualTracker.recoveringFallback(frames: frames, shownPx: shown)
+        let fallbackLiteral = L("滚过头了，往回滚到和上一帧重叠的地方才会接上 · 现在点完成会标成未完成 · ", "Scrolled too far. It joins only after you scroll back over the last frame · finishing now marks this capture incomplete · ") + stats
+
+        func input(now: Double,
+                   recovering: Bool = false,
+                   autoScroll: Bool = false,
+                   lost: Bool = false,
+                   nonzero: Bool = false,
+                   credible: Bool = true,
+                   seen: Bool = false,
+                   distance: ManualTracker.RecoveryDistance = .unknown,
+                   gauge: ManualTracker.Gauge = .idle,
+                   urgent: String? = nil,
+                   frameCount: Int = frames,
+                   px: Int = shown) -> ManualTracker.HUDInput {
+            ManualTracker.HUDInput(now: now, recovering: recovering, autoScroll: autoScroll, lost: lost,
+                                   nonzeroShift: nonzero, wheelCredible: credible, wheelSeen: seen,
+                                   distance: distance, gauge: gauge, frames: frameCount, shownPx: px, urgent: urgent)
+        }
+        func line(_ item: ManualTracker.HUDInput, hold: inout ManualTracker.HUDHold) -> String {
+            ManualTracker.hudLine(item, hold: &hold)
+        }
+
+        var steady = ManualTracker.HUDHold()
+        let sequence: [(ManualTracker.Gauge, Bool, ManualTracker.RecoveryDistance)] = [
+            (.approaching(80), true, .unknown),
+            (.approaching(40), false, .unknown),
+            (.approaching(1), true, .offset(screens: 0.4)),
+            (.ready, false, .arrived),
+            (.ready, true, .unknown),
+            (.idle, false, .offset(screens: -0.2)),
+            (.approaching(12), true, .arrived),
+            (.idle, false, .unknown),
+        ]
+        var steadyOK = true
+        var steadyDetail = ""
+        for (i, step) in sequence.enumerated() {
+            let text = line(input(now: Double(i), nonzero: step.1, distance: step.2, gauge: step.0), hold: &steady)
+            let banned = text.contains("刚接上") || text.contains("再往下滚") || text.contains("到了") || text.contains("接上了") || text.contains("Joined · ")
+            if text != stats || banned {
+                steadyOK = false
+                steadyDetail = "step \(i) got \(text)"
+                break
+            }
+        }
+        check("manual hud: ordinary frames stay on the stats line", steadyOK, steadyDetail)
+
+        var rejoin = ManualTracker.HUDHold()
+        let during = line(input(now: 10, recovering: true, seen: true, distance: .offset(screens: 1.2), gauge: .over(30)), hold: &rejoin)
+        let duringWant = ManualTracker.recoveryStatusText(.offset(screens: 1.2)) ?? ""
+        check("manual hud: recovery shows distance, not the over line",
+              during == duringWant && during != overLine && !during.contains("接上了"),
+              during)
+        let edgeAt = 11.0
+        let edge = line(input(now: edgeAt, gauge: .over(20)), hold: &rejoin)
+        let until = rejoin.joinedUntil
+        let mid = line(input(now: edgeAt + ManualTracker.joinedDwell - 0.05, nonzero: true, gauge: .approaching(8)), hold: &rejoin)
+        check("manual hud: 接上了 appears once on the falling edge and holds",
+              edge == joinedLine && mid == joinedLine && rejoin.joinedUntil == until && !edge.contains("刚接上"),
+              "edge=\(edge) mid=\(mid) until=\(rejoin.joinedUntil) want=\(until)")
+        let after = line(input(now: edgeAt + ManualTracker.joinedDwell + 0.05, nonzero: true, gauge: .ready), hold: &rejoin)
+        check("manual hud: 接上了 is gone 1.5s later, even if the frame moved",
+              after == stats && !after.contains("接上了") && !after.contains("Joined · "),
+              after)
+
+        var deadlineHold = ManualTracker.HUDHold()
+        _ = line(input(now: 0, recovering: true, seen: true, distance: .offset(screens: 1)), hold: &deadlineHold)
+        _ = line(input(now: 1, gauge: .ready), hold: &deadlineHold)
+        let deadline = 1 + ManualTracker.joinedDwell
+        let tickCanClear = deadlineHold.dwells(at: deadline)
+        let cleared = line(input(now: deadline, nonzero: true, gauge: .idle), hold: &deadlineHold)
+        check("manual hud: the tick at the end of 接上了 still draws the stats line",
+              tickCanClear && cleared == stats && !deadlineHold.dwells(at: deadline),
+              "before=\(tickCanClear) text=\(cleared) after=\(deadlineHold.dwells(at: deadline))")
+
+        var quietHold = ManualTracker.HUDHold()
+        var wheel = ManualTracker(body: 400, pixelScale: 1)
+        wheel.wheel(deltaY: -480, precise: true, at: 0)
+        func shot(_ t: Double) -> String {
+            line(input(now: t, recovering: true, credible: wheel.wheelCredible, seen: wheel.wheelSeen,
+                       distance: wheel.recovery(at: t), gauge: wheel.gauge), hold: &quietHold)
+        }
+        let live = shot(0.2)
+        let paused = shot(2)
+        let still = shot(5)
+        check("manual hud: a wheel quiet for 2s keeps the last distance",
+              wheel.wheelSeen && live == duringWant && paused == live && still == live && live != fallback,
+              "live=\(live) paused=\(paused) still=\(still)")
+        wheel.invalidateWheel()
+        let keyed = shot(5.1)
+        wheel.wheel(deltaY: -40, precise: true, at: 5.2)
+        let afterKey = shot(5.3)
+        check("manual hud: keyboard replaces the distance with the long sentence",
+              keyed == fallback && afterKey == fallback && fallback == fallbackLiteral && keyed != live,
+              "keyed=\(keyed)")
+
+        var blind = ManualTracker.HUDHold()
+        let invented = line(input(now: 0, recovering: true, seen: false, distance: .offset(screens: 3), gauge: .over(40)), hold: &blind)
+        check("manual hud: no wheel data stays on the long sentence",
+              invented == fallback && blind.lastDistanceText == nil,
+              invented)
+
+        var hyst = ManualTracker.HUDHold()
+        func distLine(_ screens: Double, gauge: ManualTracker.Gauge, now: Double) -> String {
+            line(input(now: now, recovering: true, seen: true, distance: .offset(screens: screens), gauge: gauge), hold: &hyst)
+        }
+        let far = distLine(0.2, gauge: .approaching(10), now: 0)
+        let held = line(input(now: 0.1, recovering: true, seen: true, distance: .arrived, gauge: .ready), hold: &hyst)
+        let near: [(Double, ManualTracker.Gauge)] = [
+            (0.06, .ready),
+            (0.09, .approaching(2)),
+            (ManualTracker.arrivedScreens * 2, .over(4)),
+            (0.06, .idle),
+            (-0.09, .ready),
+        ]
+        let nearOK = near.allSatisfy { distLine($0.0, gauge: $0.1, now: 0.2) == arrivedLine }
+        let leftAt = ManualTracker.arrivedScreens * 2 + 0.02
+        let left = distLine(leftAt, gauge: .approaching(1), now: 1)
+        let notBack = distLine(0.06, gauge: .ready, now: 1.1)
+        let backIn = distLine(ManualTracker.arrivedScreens * 0.5, gauge: .idle, now: 1.2)
+        let down = distLine(-0.2, gauge: .over(15), now: 1.3)
+        check("manual hud: 到了 latches until twice arrivedScreens",
+              far == (ManualTracker.recoveryStatusText(.offset(screens: 0.2)) ?? "")
+              && held == arrivedLine && nearOK
+              && left == (ManualTracker.recoveryStatusText(.offset(screens: leftAt)) ?? "")
+              && notBack == (ManualTracker.recoveryStatusText(.offset(screens: 0.06)) ?? "")
+              && notBack != arrivedLine
+              && backIn == arrivedLine
+              && down == (ManualTracker.recoveryStatusText(.offset(screens: -0.2)) ?? "")
+              && down != overLine && !hyst.overLatched,
+              "far=\(far) held=\(held) left=\(left) notBack=\(notBack) back=\(backIn) down=\(down)")
+
+        var overHold = ManualTracker.HUDHold()
+        let entered = line(input(now: 20, gauge: .over(12)), hold: &overHold)
+        let early = line(input(now: 20 + ManualTracker.overDwell - 0.05, nonzero: true, gauge: .ready), hold: &overHold)
+        let almost = line(input(now: 20 + ManualTracker.overDwell - 0.01, gauge: .approaching(6)), hold: &overHold)
+        let deadlineVisible = overHold.dwells(at: 20 + ManualTracker.overDwell)
+        let released = line(input(now: 20 + ManualTracker.overDwell + 0.05, gauge: .idle), hold: &overHold)
+        check("manual hud: .over stays at least 0.8s after it leaves",
+              entered == overLine && early == overLine && almost == overLine
+              && deadlineVisible && released == stats && !overHold.dwells(at: 20 + ManualTracker.overDwell + 0.05),
+              "entered=\(entered) early=\(early) almost=\(almost) released=\(released)")
+        var level = ManualTracker.HUDHold()
+        _ = line(input(now: 0, gauge: .over(3)), hold: &level)
+        let stayed = line(input(now: 5, nonzero: true, gauge: .over(9)), hold: &level)
+        check("manual hud: .over stays while the gauge stays over",
+              stayed == overLine && level.dwells(at: 5),
+              stayed)
+
+        var urgentHold = ManualTracker.HUDHold()
+        urgentHold.wasRecovering = true
+        let urgent = "截不到画面了"
+        let shownUrgent = line(input(now: 4, nonzero: true, gauge: .over(9), urgent: urgent), hold: &urgentHold)
+        let holdUntouched = urgentHold.wasRecovering && urgentHold.joinedUntil == -Double.infinity
+            && !urgentHold.joinedLatched && !urgentHold.overLatched
+        let thenJoined = line(input(now: 4, nonzero: true, gauge: .over(9)), hold: &urgentHold)
+        check("manual hud: an error shows at once and does not move the holds",
+              shownUrgent == urgent && holdUntouched && thenJoined == joinedLine,
+              "shown=\(shownUrgent) joined=\(thenJoined)")
+
+        var autoHold = ManualTracker.HUDHold()
+        autoHold.wasRecovering = true
+        autoHold.lastDistanceText = "keep-me"
+        let frozen = autoHold
+        let autoStats = ManualTracker.captureStats(frames: 2, shownPx: 800)
+        let lostLine = line(input(now: 1, autoScroll: true, lost: true, nonzero: true, credible: false, seen: true,
+                                  distance: .offset(screens: 2), gauge: .over(1), frameCount: 2, px: 800), hold: &autoHold)
+        let calm = line(input(now: 1, autoScroll: true, frameCount: 2, px: 800), hold: &autoHold)
+        check("auto hud: lost and steady copy stay as they were, and so does the manual hold",
+              lostLine == L("这一下没对上，往回退一点重来 · ", "Lost the place, backing up to retry · ") + autoStats
+              && calm == autoStats && autoHold == frozen,
+              "lost=\(lostLine) calm=\(calm)")
     }
 
     private static func solid(width w: Int, height h: Int, rgb: (UInt8, UInt8, UInt8), seed: UInt64) -> [UInt8] {
