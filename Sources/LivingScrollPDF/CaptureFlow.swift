@@ -153,7 +153,13 @@ struct ManualTracker {
     private(set) var raw = 0.0
     /// Recent (measured shift, wheel distance) pairs; the ratio is their sums' quotient.
     private var samples: [(d: Double, raw: Double)] = []
-    private var lastWheel = -Double.infinity
+    private(set) var lastWheel = -Double.infinity
+    /// `raw` when the picture last actually changed. Empty wheel at the top or bottom rewinds here.
+    private var restRaw = 0.0
+    /// A page that has not moved, after the wheel has been still this long, absorbed those events.
+    static let absorbStill = 0.25
+    /// Recovery "arrived" is only trusted after the wheel has been still this long and the frame is still lost.
+    static let arrivedVerifyStill = 1.0
     private var windowMisses = 0
     /// Last frame taken while past `maxShift`.
     private var lastLook = -Double.infinity
@@ -170,8 +176,10 @@ struct ManualTracker {
     /// Calibrated once the measured shifts add up to half a frame.
     var calibrated: Bool { samples.reduce(0) { $0 + abs($1.d) } >= Double(body) / 2 }
     var ratio: Double {
+        guard !samples.isEmpty else { return 1 }
         let r = samples.reduce(0) { $0 + $1.raw }
-        return abs(r) < 1 ? 1 : samples.reduce(0) { $0 + $1.d } / r
+        guard abs(r) >= 1 else { return 1 }
+        return min(4, max(0.25, samples.reduce(0) { $0 + $1.d } / r))
     }
     var estimate: Int { Int((raw * ratio).rounded()) }
 
@@ -189,9 +197,18 @@ struct ManualTracker {
     /// A wheel event has been counted. Going quiet does not clear it; keys never set it.
     var wheelSeen: Bool { lastWheel.isFinite }
 
-    mutating func wheel(deltaY: Double, precise: Bool, at t: Double) {
-        // Negative deltaY scrolls towards later content, which moves the content up (d > 0).
-        raw -= deltaY * (precise ? 1 : Self.lineHeight) * Double(pixelScale)
+    mutating func wheel(deltaY: Double, precise: Bool, at t: Double, pointDelta: Double = 0) {
+        // Negative deltaY / pointDelta scrolls towards later content, which moves the content up (d > 0).
+        // A mouse's scrollingDeltaY × 40 is about four times the real move; pointDelta is that move.
+        let points: Double
+        if precise {
+            points = deltaY
+        } else if pointDelta != 0 {
+            points = pointDelta
+        } else {
+            points = deltaY * Self.lineHeight
+        }
+        raw -= points * Double(pixelScale)
         lastWheel = t
     }
 
@@ -231,11 +248,24 @@ struct ManualTracker {
     }
 
     mutating func placed(d: Int, capture: Capture, edges newEdges: (top: Int, bottom: Int)) {
-        if abs(capture.raw) >= Double(4 * pixelScale) && d != 0 {
-            samples.append((Double(d), capture.raw))
-            while samples.count > 8 || (samples.count > 2 && samples.dropFirst().reduce(0, { $0 + abs($1.d) }) >= Double(body) * 2) { samples.removeFirst() }
+        if d != 0, capture.raw != 0 {
+            let r = Double(d) / capture.raw
+            if r >= 0.25 && r <= 4 {
+                samples.append((Double(d), capture.raw))
+                while samples.count > 8 || (samples.count > 2 && samples.dropFirst().reduce(0, { $0 + abs($1.d) }) >= Double(body) * 2) { samples.removeFirst() }
+            } else {
+                // The wheel total does not describe this move (empty notches at the top or bottom,
+                // reversed quickly). The frame just placed is the proof of where the page is.
+                raw = 0
+                restRaw = 0
+                windowMisses = 0
+                wheelCredible = true
+                edges = (min(body / 5, newEdges.top), min(body / 5, newEdges.bottom))
+                return
+            }
         }
         // What the wheel moved after the frame was taken carries over to the next one.
+        // ratio is clamped to 0.25...4, so this cannot amplify a poisoned residual.
         raw -= Double(d) / ratio
         windowMisses = 0
         wheelCredible = true
@@ -255,7 +285,21 @@ struct ManualTracker {
     /// A frame was placed outside wheel control (keyboard, scroll bar): start counting afresh.
     mutating func resync() {
         raw = 0
+        restRaw = 0
         wheelCredible = true
+    }
+
+    /// After a judged frame. Identical pixels plus a still wheel mean the page absorbed the
+    /// events (top or bottom); rewind `raw` so empty notches do not pile up. The stitcher
+    /// has already seen this frame.
+    mutating func noteJudgedFrame(identical: Bool, at t: Double) {
+        if identical {
+            if t - lastWheel > Self.absorbStill, raw != restRaw {
+                raw = restRaw
+            }
+        } else {
+            restRaw = raw
+        }
     }
 
     /// Signed distance from the last placed frame, in screens of `body`. Positive is later
@@ -297,6 +341,12 @@ struct ManualTracker {
         }
     }
 
+    /// Estimate said arrived, the wheel has been still, and the frame is still lost.
+    static func arrivedMismatchText() -> String {
+        L("数字偏了，这里还接不上 · 慢慢上下滚，接上会提示",
+          "The number is off, it still doesn't join here · scroll slowly up and down, it'll say when it joins")
+    }
+
     /// How long `.over` stays up once it appears, so a stats write cannot flicker it off.
     static let overDwell = 0.8
     /// How long the one-shot rejoin line stays up.
@@ -314,6 +364,8 @@ struct ManualTracker {
         var joinedLatched = false
         var wasRecovering = false
         var arrivedLatched = false
+        /// Recovery said "arrived" and a still, lost frame proved the number was wrong.
+        var mismatchLatched = false
         /// Last distance sentence while recovering. A quiet wheel keeps it.
         var lastDistanceText: String? = nil
 
@@ -336,6 +388,8 @@ struct ManualTracker {
         var shownPx: Int
         /// Capture, geometry and auto-pause errors. Shown as-is; holds do not move under them.
         var urgent: String? = nil
+        /// Last wheel event time; recovery "arrived" is verified against how long it has been still.
+        var lastWheelAt: Double = -.infinity
     }
 
     static func captureStats(frames: Int, shownPx: Int) -> String {
@@ -381,6 +435,7 @@ struct ManualTracker {
             hold.joinedLatched = true
             hold.lastDistanceText = nil
             hold.arrivedLatched = false
+            hold.mismatchLatched = false
         }
         hold.wasRecovering = input.recovering
         if hold.joinedLatched && input.now >= hold.joinedUntil {
@@ -411,10 +466,11 @@ struct ManualTracker {
         if !input.wheelCredible {
             hold.lastDistanceText = nil
             hold.arrivedLatched = false
+            hold.mismatchLatched = false
             return fallback
         }
         if !input.wheelSeen { return fallback }
-        if let text = distanceSentence(input.distance, hold: &hold) {
+        if let text = distanceSentence(input, hold: &hold) {
             hold.lastDistanceText = text
             return text
         }
@@ -424,21 +480,33 @@ struct ManualTracker {
     }
 
     /// "到了" enters under `arrivedScreens` and leaves only past twice that, so the boundary does not chatter.
-    private static func distanceSentence(_ distance: RecoveryDistance, hold: inout HUDHold) -> String? {
-        switch distance {
+    /// Arrived plus a still wheel and a still-lost frame is a lie: the number is off.
+    private static func distanceSentence(_ input: HUDInput, hold: inout HUDHold) -> String? {
+        let still = input.now - input.lastWheelAt
+        if still < arrivedVerifyStill { hold.mismatchLatched = false }
+        switch input.distance {
         case .unknown:
-            return nil
+            // Past the two seconds of a live wheel the number is gone, but "到了" must not stay up on a lost frame.
+            guard hold.arrivedLatched, input.lost, still > arrivedVerifyStill else { return nil }
+            return arrivedLine(lost: true, still: still, hold: &hold)
         case .arrived:
             hold.arrivedLatched = true
-            return recoveryStatusText(.arrived)
+            return arrivedLine(lost: input.lost, still: still, hold: &hold)
         case .offset(let screens):
             if hold.arrivedLatched {
                 if abs(screens) > arrivedScreens * 2 { hold.arrivedLatched = false }
             } else if abs(screens) < arrivedScreens {
                 hold.arrivedLatched = true
             }
-            if hold.arrivedLatched { return recoveryStatusText(.arrived) }
+            if hold.arrivedLatched { return arrivedLine(lost: input.lost, still: still, hold: &hold) }
+            hold.mismatchLatched = false
             return recoveryStatusText(.offset(screens: screens))
         }
+    }
+
+    private static func arrivedLine(lost: Bool, still: Double, hold: inout HUDHold) -> String {
+        if lost && still > arrivedVerifyStill { hold.mismatchLatched = true }
+        if hold.mismatchLatched { return arrivedMismatchText() }
+        return recoveryStatusText(.arrived) ?? arrivedMismatchText()
     }
 }

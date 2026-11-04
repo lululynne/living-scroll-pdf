@@ -824,6 +824,7 @@ enum SelfTest {
 
         recoveryDistance(check)
         hudStability(check)
+        wheelCalibration(check)
 
         // 8. Export round trip.
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("livingscrollpdf-selftest-\(getpid())")
@@ -1176,10 +1177,12 @@ enum SelfTest {
                    gauge: ManualTracker.Gauge = .idle,
                    urgent: String? = nil,
                    frameCount: Int = frames,
-                   px: Int = shown) -> ManualTracker.HUDInput {
+                   px: Int = shown,
+                   lastWheel: Double = -.infinity) -> ManualTracker.HUDInput {
             ManualTracker.HUDInput(now: now, recovering: recovering, autoScroll: autoScroll, lost: lost,
                                    nonzeroShift: nonzero, wheelCredible: credible, wheelSeen: seen,
-                                   distance: distance, gauge: gauge, frames: frameCount, shownPx: px, urgent: urgent)
+                                   distance: distance, gauge: gauge, frames: frameCount, shownPx: px, urgent: urgent,
+                                   lastWheelAt: lastWheel)
         }
         func line(_ item: ManualTracker.HUDInput, hold: inout ManualTracker.HUDHold) -> String {
             ManualTracker.hudLine(item, hold: &hold)
@@ -1334,6 +1337,171 @@ enum SelfTest {
               lostLine == L("这一下没对上，往回退一点重来 · ", "Lost the place, backing up to retry · ") + autoStats
               && calm == autoStats && autoHold == frozen,
               "lost=\(lostLine) calm=\(calm)")
+
+        var mismatchHold = ManualTracker.HUDHold()
+        let mismatchWant = ManualTracker.arrivedMismatchText()
+        let arrivedHeld = line(input(now: 0.2, recovering: true, seen: true, distance: .arrived, lastWheel: 0.15), hold: &mismatchHold)
+        let proved = line(input(now: 1.3, recovering: true, lost: true, seen: true, distance: .arrived, lastWheel: 0.2), hold: &mismatchHold)
+        let stillLost = line(input(now: 1.5, recovering: true, lost: false, seen: true, distance: .arrived, lastWheel: 0.2), hold: &mismatchHold)
+        let moved = line(input(now: 1.6, recovering: true, lost: true, seen: true, distance: .offset(screens: 0.4), lastWheel: 1.6), hold: &mismatchHold)
+        let movedWant = ManualTracker.recoveryStatusText(.offset(screens: 0.4)) ?? ""
+        check("manual hud: arrived + still >1s + lost is 数字偏了; wheel moving restores the number",
+              arrivedHeld == arrivedLine && proved == mismatchWant && stillLost == mismatchWant
+              && moved == movedWant && moved != mismatchWant && moved != arrivedLine,
+              "held=\(arrivedHeld) proved=\(proved) still=\(stillLost) moved=\(moved)")
+    }
+
+    /// Mouse wheel pointDelta, poisoned-ratio samples, top/bottom absorb, overshoot recovery.
+    private static func wheelCalibration(_ check: (String, Bool, String) -> Void) {
+        func inRange(_ r: Double) -> Bool { r > 0 && r >= 0.25 && r <= 4 }
+
+        var mouse = ManualTracker(body: 383, pixelScale: 1)
+        let before36 = mouse.raw
+        mouse.wheel(deltaY: 3.5692138671875, precise: false, at: 0, pointDelta: 36)
+        check("imprecise wheel point=36 moves raw by 36×scale, not scrollingDeltaY×40",
+              mouse.raw - before36 == -36, "raw=\(mouse.raw) delta=\(mouse.raw - before36)")
+
+        var fallback = ManualTracker(body: 400, pixelScale: 2)
+        fallback.wheel(deltaY: 0.5, precise: false, at: 0, pointDelta: 0)
+        check("imprecise wheel with pointDelta 0 falls back to deltaY×40",
+              fallback.raw == -0.5 * 40 * 2, "raw=\(fallback.raw)")
+
+        var opposite = ManualTracker(body: 400, pixelScale: 1)
+        opposite.placed(d: -50, capture: ManualTracker.Capture(expected: 200, tolerance: 48, raw: 200), edges: (0, 0))
+        check("opposite-sign sample does not enter ratio",
+              opposite.ratio == 1 && !opposite.calibrated, "ratio=\(opposite.ratio)")
+
+        var weak = ManualTracker(body: 400, pixelScale: 1)
+        weak.placed(d: 10, capture: ManualTracker.Capture(expected: 1000, tolerance: 48, raw: 1000), edges: (0, 0))
+        check("|d/raw|<0.25 sample does not enter ratio",
+              weak.ratio == 1 && !weak.calibrated, "ratio=\(weak.ratio)")
+
+        var good = ManualTracker(body: 400, pixelScale: 1)
+        good.wheel(deltaY: -200, precise: true, at: 0)
+        if let cap = good.capture(at: 0.4) {
+            good.placed(d: 200, capture: cap, edges: (0, 0))
+            check("same-sign in-range sample is kept, ratio stays in 0.25...4",
+                  inRange(good.ratio) && good.calibrated, "ratio=\(good.ratio)")
+        } else {
+            check("same-sign in-range sample is kept, ratio stays in 0.25...4", false, "no capture")
+        }
+
+        var absorb = ManualTracker(body: 400, pixelScale: 1)
+        absorb.noteJudgedFrame(identical: false, at: 0)
+        absorb.wheel(deltaY: 1, precise: false, at: 1.0, pointDelta: 300)
+        absorb.noteJudgedFrame(identical: true, at: 1.20)
+        let early = absorb.raw
+        absorb.noteJudgedFrame(identical: true, at: 1.24)
+        let tooSoon = absorb.raw
+        absorb.noteJudgedFrame(identical: true, at: 1.26)
+        let afterAbsorb = absorb.raw
+        absorb.wheel(deltaY: -1, precise: false, at: 2.0, pointDelta: -100)
+        check("same frame under 0.25s still does not absorb",
+              abs(early - (-300)) < 0.5 && abs(tooSoon - (-300)) < 0.5, "early=\(early) tooSoon=\(tooSoon)")
+        check("empty 300 then down 100: after absorb, estimate ≈ 100",
+              abs(afterAbsorb) < 0.5 && abs(Double(absorb.estimate) - 100) <= 2,
+              "afterAbsorb=\(afterAbsorb) est=\(absorb.estimate)")
+
+        var over = ManualTracker(body: 400, pixelScale: 1)
+        over.wheel(deltaY: -200, precise: true, at: 0)
+        if let cap = over.capture(at: 0.4) {
+            over.placed(d: 200, capture: cap, edges: (0, 0))
+            over.noteJudgedFrame(identical: false, at: 0.4)
+            over.wheel(deltaY: -2000, precise: true, at: 1)
+            over.lost(cap)
+            over.wheel(deltaY: 2000, precise: true, at: 2)
+            let err = abs(over.estimate)
+            check("overshoot 5 screens then back to 0: error ≤ 10% of a screen when ratio is right",
+                  inRange(over.ratio) && err <= 40, "est=\(over.estimate) ratio=\(over.ratio)")
+        } else {
+            check("overshoot 5 screens then back to 0: error ≤ 10% of a screen when ratio is right", false, "no capture")
+        }
+
+        // Trace 60–86: mouse pointDelta and the shifted(d) that actually landed.
+        struct Event { let t: Double; let point: Double?; let d: Int? }
+        let events: [Event] = [
+            .init(t: 9.072, point: 1, d: nil),
+            .init(t: 9.118, point: nil, d: 0),
+            .init(t: 9.236, point: nil, d: 0),
+            .init(t: 9.271, point: 1, d: nil),
+            .init(t: 9.359, point: nil, d: 0),
+            .init(t: 9.479, point: nil, d: 0),
+            .init(t: 9.486, point: 1, d: nil),
+            .init(t: 9.582, point: 3, d: nil),
+            .init(t: 9.597, point: nil, d: 0),
+            .init(t: 9.625, point: 15, d: nil),
+            .init(t: 9.680, point: 28, d: nil),
+            .init(t: 9.720, point: nil, d: 0),
+            .init(t: 9.741, point: 36, d: nil),
+            .init(t: 9.836, point: nil, d: 0),
+            .init(t: 9.959, point: nil, d: 0),
+            .init(t: 9.979, point: -1, d: nil),
+            .init(t: 10.065, point: -4, d: nil),
+            .init(t: 10.089, point: nil, d: 1),
+            .init(t: 10.187, point: nil, d: 4),
+            .init(t: 10.315, point: nil, d: 0),
+            .init(t: 10.439, point: nil, d: 0),
+            .init(t: 10.559, point: nil, d: 0),
+            .init(t: 10.614, point: 1, d: nil),
+            .init(t: 10.683, point: 6, d: nil),
+            .init(t: 10.685, point: nil, d: -1),
+            .init(t: 10.715, point: 24, d: nil),
+            .init(t: 10.804, point: nil, d: -4),
+        ]
+        var trace = ManualTracker(body: 383, pixelScale: 1)
+        trace.noteJudgedFrame(identical: false, at: 9.0)
+        var ratioOK = true
+        var amplified = false
+        var truth = 0
+        var firstWheels: [Double] = []
+        for e in events {
+            if let p = e.point {
+                let before = trace.raw
+                trace.wheel(deltaY: p > 0 ? 0.1 : -0.1, precise: false, at: e.t, pointDelta: p)
+                if firstWheels.count < 3 && p == 1 { firstWheels.append(trace.raw - before) }
+            }
+            if let d = e.d {
+                let rawBefore = trace.raw
+                if d != 0 {
+                    let cap = ManualTracker.Capture(expected: trace.estimate, tolerance: 45, raw: trace.raw)
+                    trace.placed(d: d, capture: cap, edges: (0, 0))
+                    truth += d
+                    // Clearing a wheel total the page never followed is fine; growing it is not.
+                    if abs(trace.raw) > abs(rawBefore) + abs(Double(d)) * 4 + 1 { amplified = true }
+                    trace.noteJudgedFrame(identical: false, at: e.t)
+                } else {
+                    trace.noteJudgedFrame(identical: true, at: e.t)
+                }
+                if !inRange(trace.ratio) { ratioOK = false }
+            }
+        }
+        check("trace 60–86: first point=1 wheels move raw by −1, not −4",
+              firstWheels.count == 3 && firstWheels.allSatisfy { abs($0 - (-1)) < 0.01 },
+              "\(firstWheels)")
+        check("trace 60–86: ratio stays positive and in 0.25...4, raw is not amplified",
+              ratioOK && !amplified && inRange(trace.ratio),
+              "ratio=\(trace.ratio) amplified=\(amplified) raw=\(trace.raw) est=\(trace.estimate) truth=\(truth)")
+        // Each frame placed in this trace contradicts the wheel total, so nothing of it may survive:
+        // the page is at the last placed frame. The poisoned ratio used to leave raw in the hundreds.
+        check("trace 60–86: nothing of the contradicted wheel total survives the last placed frame",
+              trace.estimate == 0 && trace.raw == 0,
+              "est=\(trace.estimate) raw=\(trace.raw) ratio=\(trace.ratio)")
+
+        var pairs = ManualTracker(body: 383, pixelScale: 1)
+        var pairsOK = true
+        var pairsDetail = ""
+        for (p, d) in [(-1.0, 1), (-4.0, 4), (1.0, -1)] {
+            pairs.wheel(deltaY: p, precise: false, at: 0, pointDelta: p)
+            let cap = ManualTracker.Capture(expected: pairs.estimate, tolerance: 45, raw: pairs.raw)
+            pairs.placed(d: d, capture: cap, edges: (0, 0))
+            if abs(pairs.estimate) > 2 || !inRange(pairs.ratio) {
+                pairsOK = false
+                pairsDetail = "point=\(p) d=\(d) est=\(pairs.estimate) ratio=\(pairs.ratio) raw=\(pairs.raw)"
+                break
+            }
+        }
+        check("trace point→d pairs: estimate stays on the measured shift",
+              pairsOK && inRange(pairs.ratio), pairsDetail)
     }
 
     private static func solid(width w: Int, height h: Int, rgb: (UInt8, UInt8, UInt8), seed: UInt64) -> [UInt8] {

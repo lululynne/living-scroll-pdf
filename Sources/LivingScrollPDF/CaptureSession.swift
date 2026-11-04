@@ -49,6 +49,8 @@ final class CaptureSession {
     private var captureFailures = 0
     private var status = L("准备中…", "Getting ready…")
     private var dumpIndex = 0
+    /// Last judged picture; a still, identical frame means the page absorbed the wheel.
+    private var lastSeenFrame: PixelFrame?
 
     private let border: BorderWindow
     private let hud: HUDPanel
@@ -216,6 +218,7 @@ final class CaptureSession {
             inFlight = false
             guard !finishing else { return }
             if ProcessInfo.processInfo.environment["JZ_TEST_OWNER"] != nil { print("frame \(dumpIndex): \(outcome)") }
+            trace("frame\t\(dumpIndex)\t\(outcome)\texpected=\(expected.map(String.init) ?? "nil")\ttol=\(tolerance)\traw=\(tracker?.raw ?? 0)\tratio=\(tracker?.ratio ?? 0)\test=\(tracker?.estimate ?? 0)\tbody=\(tracker?.body ?? 0)")
             if !auto {
                 switch (outcome, request) {
                 case (.shifted(let d), let r?) where d != 0: tracker?.placed(d: d, capture: r, edges: edges)
@@ -224,6 +227,9 @@ final class CaptureSession {
                 case (.first, _): tracker?.resync()
                 default: break
                 }
+                let same = lastSeenFrame.map { $0.width == frame.width && $0.height == frame.height && $0.bytes == frame.bytes } ?? false
+                tracker?.noteJudgedFrame(identical: same, at: now)
+                lastSeenFrame = frame
             }
             // Manual mode: the seam line and overlap limits follow the part of the view that scrolls.
             if case .shifted(let d) = outcome, d != 0 { tracker?.body = max(64, Int((Double(frame.height) * share).rounded())) }
@@ -282,7 +288,8 @@ final class CaptureSession {
             gauge: tracker?.gauge ?? .idle,
             frames: lastStats.frames,
             shownPx: shown,
-            urgent: urgentStatus
+            urgent: urgentStatus,
+            lastWheelAt: tracker?.lastWheel ?? -.infinity
         )
         update(ManualTracker.hudLine(input, hold: &hudHold))
     }
@@ -291,6 +298,8 @@ final class CaptureSession {
     private func startWheelMonitor() {
         wheelMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] e in
             let dy = e.scrollingDeltaY, precise = e.hasPreciseScrollingDeltas
+            let rawDelta = e.deltaY
+            let pointDelta = e.cgEvent?.getDoubleValueField(.scrollWheelEventPointDeltaAxis1) ?? 0
             let loc = NSEvent.mouseLocation
             MainActor.assumeIsolated {
                 guard let self, !self.autoScroll else { return }
@@ -301,7 +310,8 @@ final class CaptureSession {
                 let region = self.sourceRect.offsetBy(dx: frame.minX, dy: frame.minY)
                 guard region.contains(point), WindowList.frontmost(at: point)?.id == self.pick.windowID else { return }
                 self.noteInput()
-                self.tracker?.wheel(deltaY: dy, precise: precise, at: self.now)
+                self.tracker?.wheel(deltaY: dy, precise: precise, at: self.now, pointDelta: pointDelta)
+                self.traceWheel(e0: rawDelta, dy: dy, precise: precise, pointDelta: pointDelta)
                 // Distance figures follow the wheel itself, not the next captured frame.
                 // `.over` does too: the dwell starts when the wheel crosses the line.
                 if let t = self.tracker {
@@ -323,6 +333,19 @@ final class CaptureSession {
                 if self.recovering { self.publishHUD(lost: false, nonzeroShift: false) }
             }
         }
+    }
+
+    /// Diagnostic log next to JZ_DUMP frames: one line per wheel event and per judged frame.
+    private func trace(_ line: String) {
+        guard let dump = ProcessInfo.processInfo.environment["JZ_DUMP"] else { return }
+        let data = Data((String(format: "%.3f\t", now) + line + "\n").utf8)
+        let log = URL(fileURLWithPath: dump).appendingPathComponent("trace.tsv")
+        if let h = try? FileHandle(forWritingTo: log) { h.seekToEndOfFile(); h.write(data); try? h.close() }
+        else { try? data.write(to: log) }
+    }
+
+    private func traceWheel(e0: CGFloat, dy: CGFloat, precise: Bool, pointDelta: Double) {
+        trace("wheel\tdeltaY=\(e0)\tscrollingDeltaY=\(dy)\tprecise=\(precise)\tpoint=\(pointDelta)\traw=\(tracker?.raw ?? 0)\test=\(tracker?.estimate ?? 0)")
     }
 
     private func noteInput() {
