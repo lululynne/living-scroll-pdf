@@ -1083,14 +1083,27 @@ enum SelfTest {
         let up = ManualTracker.recoveryStatusText(.offset(screens: 3.21))
         let down = ManualTracker.recoveryStatusText(.offset(screens: -0.84))
         let near = ManualTracker.unconfirmedNearText()
+        let neutral = ManualTracker.pictureNeutralText()
         check("recovery copy: still going up is an estimate, not a fact",
               up == L("还没接上 · 约 ↑ +3.2 屏，继续往上", "not joined yet · about ↑ +3.2 screens, keep going up"),
               up ?? "-")
         check("recovery copy: at or past the break has no number and does not say 到了",
-              down == near && ManualTracker.recoveryStatusText(.arrived) == near
+              down == neutral && ManualTracker.recoveryStatusText(.arrived) == neutral
               && ManualTracker.recoveryStatusText(.offset(screens: 0.3)) == near
-              && near.contains("继续往上") && !near.contains("到了") && !near.contains("往下") && !near.contains("数字偏了"),
-              "down=\(down ?? "-") near=\(near)")
+              && near.contains("继续往上") && !near.contains("到了") && !near.contains("往下") && !near.contains("数字偏了")
+              && !neutral.contains("往上") && !neutral.contains("往下") && !neutral.contains("到了"),
+              "down=\(down ?? "-") near=\(near) neutral=\(neutral)")
+        let nonPositive = [-0.5, -2.0, 0.0].map { ManualTracker.recoveryStatusText(.offset(screens: $0)) ?? "" }
+        let plusNear = ManualTracker.recoveryStatusText(.offset(screens: 0.2)) ?? ""
+        let allCopy = [up ?? "", down ?? "", near, neutral, plusNear] + nonPositive
+            + [ManualTracker.numberlessDownText(), ManualTracker.locatedDownText(-2), ManualTracker.recoveryStatusText(.arrived) ?? ""]
+        check("recovery copy: offset ≤ 0 is the neutral sentence, with no 往上 or 往下",
+              nonPositive.allSatisfy { $0 == neutral && !$0.contains("往上") && !$0.contains("往下") && !$0.contains("到了") }
+              && plusNear == near && !plusNear.contains("到了"),
+              "nonPositive=\(nonPositive) plusNear=\(plusNear)")
+        check("recovery copy: none of the sentences say 到了",
+              allCopy.allSatisfy { !$0.contains("到了") },
+              allCopy.filter { $0.contains("到了") }.joined(separator: " | "))
         check("recovery copy: unknown has no invented number",
               ManualTracker.recoveryStatusText(.unknown) == nil, "")
 
@@ -1273,6 +1286,7 @@ enum SelfTest {
             line(input(now: now, recovering: true, seen: true, distance: .offset(screens: screens), gauge: gauge), hold: &hyst)
         }
         let noNumber = ManualTracker.unconfirmedNearText()
+        let closeNeutral = ManualTracker.pictureNeutralText()
         let closeSamples: [(Double, ManualTracker.Gauge)] = [
             (0.2, .approaching(10)),
             (0.06, .ready),
@@ -1285,11 +1299,12 @@ enum SelfTest {
         let held = line(input(now: 0.1, recovering: true, seen: true, distance: .arrived, gauge: .ready), hold: &hyst)
         let numbered = distLine(0.4, gauge: .approaching(1), now: 1)
         let numberedWant = ManualTracker.recoveryStatusText(.offset(screens: 0.4)) ?? ""
-        let closeOK = closeLines.allSatisfy {
-            $0 == noNumber && !$0.contains("到了") && !$0.contains("数字偏了") && !$0.contains("往下") && !$0.contains("约")
+        let closeOK = zip(closeSamples, closeLines).allSatisfy { sample, text in
+            let want = sample.0 > 0 ? noNumber : closeNeutral
+            return text == want && !text.contains("到了") && !text.contains("数字偏了") && !text.contains("约")
         }
         check("manual hud: within 0.3 screens there is no number, no 到了 and no 数字偏了",
-              closeOK && held == noNumber && !held.contains("到了")
+              closeOK && held == closeNeutral && !held.contains("到了")
               && numbered == numberedWant && numbered.contains("约 ↑") && numbered.contains("+0.4")
               && !numbered.contains("到了") && !numbered.contains("数字偏了") && !numbered.contains("往下")
               && numbered != overLine && !hyst.overLatched,
@@ -1337,14 +1352,14 @@ enum SelfTest {
               "lost=\(lostLine) calm=\(calm)")
 
         var mismatchHold = ManualTracker.HUDHold()
-        let nearLine = ManualTracker.unconfirmedNearText()
+        let arrivedLine = ManualTracker.pictureNeutralText()
         let arrivedHeld = line(input(now: 0.2, recovering: true, seen: true, distance: .arrived, lastWheel: 0.15), hold: &mismatchHold)
         let proved = line(input(now: 1.3, recovering: true, lost: true, seen: true, distance: .arrived, lastWheel: 0.2), hold: &mismatchHold)
         let stillLost = line(input(now: 1.5, recovering: true, lost: false, seen: true, distance: .arrived, lastWheel: 0.2), hold: &mismatchHold)
         let moved = line(input(now: 1.6, recovering: true, lost: true, seen: true, distance: .offset(screens: 0.4), lastWheel: 1.6), hold: &mismatchHold)
         let movedWant = ManualTracker.recoveryStatusText(.offset(screens: 0.4)) ?? ""
         check("manual hud: a still lost frame near zero stays numberless; past 0.3 screens the estimate returns",
-              arrivedHeld == nearLine && proved == nearLine && stillLost == nearLine
+              arrivedHeld == arrivedLine && proved == arrivedLine && stillLost == arrivedLine
               && !proved.contains("数字偏了") && !proved.contains("到了")
               && moved == movedWant && moved.contains("约 ↑") && !moved.contains("数字偏了"),
               "held=\(arrivedHeld) proved=\(proved) still=\(stillLost) moved=\(moved)")
@@ -1491,8 +1506,13 @@ enum SelfTest {
                 bad = "est=\(est) screens=\(screens) text=\(text)"
                 break
             }
-            if screens <= 0.3, text != noNumber { bad = "near est=\(est) \(text)"; break }
             if screens > 0.3, !text.contains("约 ↑") || text.contains("往下") { bad = "far est=\(est) \(text)"; break }
+            if screens > 0, screens <= 0.3, abs(screens) >= ManualTracker.arrivedScreens, text != noNumber {
+                bad = "near est=\(est) \(text)"; break
+            }
+            if screens <= 0 || abs(screens) < ManualTracker.arrivedScreens {
+                if text != ManualTracker.pictureNeutralText() { bad = "neutral est=\(est) \(text)"; break }
+            }
         }
         let edge = ManualTracker.hudLine(
             ManualTracker.HUDInput(now: 1000, recovering: false, wheelSeen: true, frames: 4, shownPx: 2400),
@@ -1543,6 +1563,14 @@ enum SelfTest {
         check("inside 0.1 screen the 往下 line has no digit and no 0.0",
               tiny == ManualTracker.numberlessDownText() && tiny.contains("往下") && !tiny.contains("0.0") && !tiny.contains("约"),
               tiny)
+
+        var plus = ManualTracker.HUDHold()
+        ManualTracker.integrateLocate(.found(-Int(0.2 * Double(body))), rawAtTake: 0, now: 0, hold: &plus)
+        let plusLine = line(&plus, now: 0.1, raw: 0.4 * Double(body), distance: .offset(screens: 4))
+        check("picture screens +0.2 is the neutral sentence, not 往下",
+              plusLine == ManualTracker.pictureNeutralText() && plus.picture?.neutral == true
+              && !plusLine.contains("往上") && !plusLine.contains("往下") && !plusLine.contains("到了"),
+              plusLine)
 
         var stay = ManualTracker.HUDHold()
         ManualTracker.integrateLocate(.found(-400), rawAtTake: 0, now: 0, hold: &stay)

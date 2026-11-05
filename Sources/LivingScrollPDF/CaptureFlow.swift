@@ -310,7 +310,7 @@ struct ManualTracker {
         case offset(screens: Double)
     }
 
-    /// Closer than this, the distance is `.arrived`. The bar prints no number either way.
+    /// Closer than this, the distance is `.arrived`. The bar prints no number and no direction.
     static let arrivedScreens = 0.05
 
     static func recoveryDistance(estimate: Int, body: Int, wheelActive: Bool, wheelCredible: Bool) -> RecoveryDistance {
@@ -325,22 +325,24 @@ struct ManualTracker {
     }
 
     /// Unconfirmed wheel copy. `.unknown` is nil so a quiet wheel keeps the last sentence.
-    /// Above 0.3 screens and still positive: an approximate "keep going up". At or below 0.3,
-    /// including a negative estimate, there is no number and no "到了".
+    /// Above 0.3 screens and still positive: an approximate "keep going up".
+    /// Between 0 and 0.3: the same sentence without a number.
+    /// At or below 0, and `.arrived`: no direction. Never "到了".
     static func recoveryStatusText(_ d: RecoveryDistance) -> String? {
         switch d {
         case .unknown:
             return nil
         case .arrived:
-            return unconfirmedNearText()
+            return pictureNeutralText()
         case .offset(let screens):
+            if screens <= 0 { return pictureNeutralText() }
             guard screens > 0.3 else { return unconfirmedNearText() }
             let n = String(format: "%+.1f", screens)
             return L("还没接上 · 约 ↑ \(n) 屏，继续往上", "not joined yet · about ↑ \(n) screens, keep going up")
         }
     }
 
-    /// Wheel estimate is at the break, past it, or too close to print. The page has not joined.
+    /// Small positive unconfirmed wheel copy. No number. The page has not joined.
     static func unconfirmedNearText() -> String {
         L("还没接上 · 继续往上，接上会提示", "not joined yet · keep going up, it'll say when it joins")
     }
@@ -351,12 +353,12 @@ struct ManualTracker {
         return L("滚过头了 · 往下约 \(n) 屏", "too far · about \(n) screens down")
     }
 
-    /// Picture says down, but the live distance is inside 0.1 screen. No digit, so it cannot say 0.0.
+    /// Picture says down, and |screens| is at or inside `pictureNumberFloor`. No digit, so it cannot say 0.0.
     static func numberlessDownText() -> String {
         L("滚过头了 · 往下，接上会提示", "too far · scroll down, it'll say when it joins")
     }
 
-    /// The down proof was reversed, contradicted, or unmatched for too long.
+    /// No proved direction. Used when a down proof is gone, and when the wheel is at or past the break.
     static func pictureNeutralText() -> String {
         L("还没接上 · 慢慢上下滚，接上会提示", "not joined yet · roll slowly up and down, it'll say when it joins")
     }
@@ -471,9 +473,10 @@ struct ManualTracker {
     /// "刚接上", so the bar flickered. Those are gone. `.over` stays at least `overDwell`
     /// seconds. "接上了" is only the falling edge of `recovering`, held `joinedDwell`
     /// seconds. While recovering, a positive wheel estimate above 0.3 screens is an
-    /// approximation; at or below that, and for every negative estimate, there is no number.
+    /// approximation; between 0 and 0.3 it says keep going up with no number.
+    /// At or below 0, and on `.arrived`, there is no direction.
     /// A picture proof of earlier content says "往下" and follows the wheel from the raw
-    /// at the shot. It is not replaced by an older "约 ↑". Inside 0.1 screen the digits drop.
+    /// at the shot. It is not replaced by an older "约 ↑". Inside `pictureNumberFloor` the digits drop.
     /// A reverse of 0.15 screen, a positive match, or a miss held for 2 s asks for a slow roll.
     /// A wheel that goes quiet keeps the last unconfirmed sentence only when no picture is up.
     /// A non-credible wheel — or no wheel at all — uses the long sentence, picture included.
@@ -548,8 +551,8 @@ struct ManualTracker {
             }
             hold.picture = pic
             let screens = (Double(pic.pixels) + moved) / Double(body)
-            // Well past the break again: the picture no longer says which way.
-            if screens > 0.3 {
+            // Positive beyond the floor: the picture no longer says which way.
+            if screens > pictureNumberFloor {
                 pic.neutral = true
                 hold.picture = pic
                 hold.lastDistanceText = nil
