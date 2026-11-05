@@ -160,6 +160,18 @@ final class Stitcher: @unchecked Sendable {
     private(set) var xOffset = 0
     /// Rows of the reference frame that the last non-zero placement saw move with the content.
     private var movedBody: Range<Int>?
+    /// Next caller-clock `t` at which `locateLost` may search. A search that took `dt`
+    /// seconds waits `max(0.3, 10*dt)`, measured from the caller's `t`, so a slow search
+    /// stays under about a tenth of the calls and a fast one still answers at 0.3 s.
+    private var nextLocateAt = -Double.infinity
+    /// Quantised row hashes for `locate`, one per canvas row. Nil is a flat row.
+    /// Rebuilt when width or scale changes; otherwise updated on the rows just written.
+    private var locateHashes: [UInt64?] = []
+    private var locateIndex: [UInt64: [Int]] = [:]
+    /// Hashes seen on more than 64 rows. Those rows are not listed. Dropping one later
+    /// leaves the hash saturated, so a search can miss and cannot gain a false row.
+    private var locateSaturated = Set<UInt64>()
+    private var locateKey: (width: Int, scale: Int, x0: Int, x1: Int)?
 
     private struct PairAnalysis {
         let top: Int
@@ -249,6 +261,7 @@ final class Stitcher: @unchecked Sendable {
                 canvas.replaceSubrange(((prevOrigin + rewrite.lowerBound) * stride)..<((prevOrigin + rewrite.upperBound) * stride),
                                        with: frame.bytes[(rewrite.lowerBound * stride)..<(rewrite.upperBound * stride)])
                 paintKnob(frame, rows: rewrite, origin: prevOrigin)
+                refreshLocateRows((prevOrigin + rewrite.lowerBound)..<(prevOrigin + rewrite.upperBound))
             }
             prev = frame
             if let f = far, f.origin == prevOrigin { far = (frame, f.origin, f.top) }
@@ -299,6 +312,7 @@ final class Stitcher: @unchecked Sendable {
             let keep = origin + cut
             canvas.removeLast((canvasRows - keep) * frame.width * 4)
             canvasRows = keep
+            shrinkLocateRows(to: keep)
             far = nil
         }
         if canvasRows < bridgeEnd {
@@ -326,12 +340,16 @@ final class Stitcher: @unchecked Sendable {
         // Where the previous frame showed the content now under it, uncovered, that is used instead.
         if d > 0, let pin = pinnedRect(p, frame, body: a.top..<bottom, d: d) {
             let stride = frame.width * 4
+            var touched = 0..<0
             for fy in max(writtenFrom - origin, pin.rows.lowerBound)..<max(max(writtenFrom - origin, pin.rows.lowerBound), min(canvasRows - origin, pin.rows.upperBound)) {
                 let py = fy + d
                 guard py < bottom, !pin.rows.contains(py) else { continue }
                 let dst = (origin + fy) * stride + pin.cols.lowerBound * 4, src = py * stride + pin.cols.lowerBound * 4
                 canvas.replaceSubrange(dst..<(dst + pin.cols.count * 4), with: p.bytes[src..<(src + pin.cols.count * 4)])
+                let cy = origin + fy
+                touched = touched.isEmpty ? cy..<(cy + 1) : min(touched.lowerBound, cy)..<max(touched.upperBound, cy + 1)
             }
+            if !touched.isEmpty { refreshLocateRows(touched) }
         }
         prevOrigin = origin
         prevTop = a.top
@@ -359,6 +377,242 @@ final class Stitcher: @unchecked Sendable {
         needsRecovery = true
         staticRun = 0
         return .lost
+    }
+
+    /// Where a lost frame sits in the canvas, if it sits in exactly one place.
+    enum LocateVerdict: Equatable {
+        /// Another search ran less than 0.3 s ago. The caller keeps the previous result.
+        case skipped
+        /// Searched. No unique position (missing, several, or exactly on the last frame).
+        case none
+        /// Signed pixels from the last placed frame's row 0 to this frame's row 0.
+        /// Negative: this frame is earlier content, already in the canvas.
+        case found(Int)
+    }
+
+    /// Read-only. Does not write the canvas, move `prev`, or change what `add` would accept.
+    /// `nil` means not found, more than one place, or the same place as the last frame.
+    /// The frame is shifted by `xOffset` on the same condition as `add`, so a sideways
+    /// re-anchor still lines the columns up.
+    func locate(_ raw: PixelFrame) -> Int? {
+        let frame = xOffset == 0 || raw.width != width ? raw : raw.shiftedLeft(by: xOffset)
+        guard let p = prev, started, canvasRows > 0, width > 0, frame.width == width, frame.height == p.height else { return nil }
+        guard canvas.count == canvasRows * width * 4 else { return nil }
+        guard let span = locateColumns() else { return nil }
+        let x0 = span.x0, x1 = span.x1
+        let y0 = frame.height / 5
+        let y1 = frame.height * 4 / 5
+        guard y1 - y0 >= 8 else { return nil }
+        ensureLocateIndex()
+        guard locateHashes.count == canvasRows else { return nil }
+
+        var all: [(fy: Int, hash: UInt64)] = []
+        frame.bytes.withUnsafeBufferPointer { fb in
+            for y in y0..<y1 {
+                if let h = rowSignature(fb, width: frame.width, y: y, x0: x0, x1: x1) {
+                    all.append((y, h))
+                }
+            }
+        }
+        let want = 16
+        let anchors: [(fy: Int, hash: UInt64)]
+        if all.count <= want {
+            anchors = all
+        } else {
+            anchors = (0..<want).map { k in all[k * all.count / want] }
+        }
+        guard anchors.count >= 8 else { return nil }
+
+        var votes: [Int: Int] = [:]
+        for a in anchors {
+            guard let rows = locateIndex[a.hash] else { continue }
+            for cy in rows {
+                votes[cy - a.fy, default: 0] += 1
+            }
+        }
+        // Vote ties used to follow Dictionary order, which changes per process. Higher
+        // votes first, then the smaller origin, and every seed that clears the vote floor is checked.
+        let seeds = votes.filter { $0.value >= 4 }.sorted { a, b in
+            if a.value != b.value { return a.value > b.value }
+            return a.key < b.key
+        }
+        guard let best = seeds.first else { return nil }
+
+        func verifies(_ origin: Int) -> Bool {
+            var tried = 0, ok = 0
+            for a in anchors {
+                let cy = origin + a.fy
+                guard cy >= 0, cy < canvasRows else { continue }
+                tried += 1
+                if canvasRowMatches(frame, fy: a.fy, cy: cy, x0: x0, x1: x1) { ok += 1 }
+            }
+            // Three quarters of the anchors must land on the canvas and 15 of 16 of those must
+            // agree: repeated forms can differ on whole lines and still pass a looser share.
+            // The vote floor stays at 4; raising it drops true hits.
+            return tried >= 8 && ok * 16 >= tried * 15 && tried * 4 >= anchors.count * 3
+        }
+        guard verifies(best.key) else { return nil }
+        for other in seeds.dropFirst() {
+            if abs(other.key - best.key) <= 3 { continue }
+            if verifies(other.key) { return nil }
+        }
+        let d = best.key - prevOrigin
+        return d == 0 ? nil : d
+    }
+
+    /// `locate` at most once per quiet interval. Skipped calls do not search and do not
+    /// move the next allowed time. The interval is `max(0.3, 10 * dt)` added to the
+    /// caller's `t` (not to `t + dt`), so the 0.3 s tests still fire when the search is fast.
+    func locateLost(_ frame: PixelFrame, at t: Double) -> LocateVerdict {
+        if t < nextLocateAt { return .skipped }
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        let d = locate(frame)
+        let dt = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
+        nextLocateAt = t + max(0.3, dt * 10)
+        return d.map { .found($0) } ?? .none
+    }
+
+    private func locateColumns() -> (x0: Int, x1: Int)? {
+        guard width > 0 else { return nil }
+        let x1 = width - max(16, 12 * pixelScale)
+        let x0 = 0
+        guard x1 - x0 >= 8 else { return nil }
+        return (x0, x1)
+    }
+
+    private func locateSpanCurrent(_ span: (x0: Int, x1: Int)) -> Bool {
+        guard let key = locateKey else { return false }
+        return key.width == width && key.scale == pixelScale && key.x0 == span.x0 && key.x1 == span.x1
+    }
+
+    private func invalidateLocateIndex() {
+        locateHashes = []
+        locateIndex = [:]
+        locateSaturated = []
+        locateKey = nil
+    }
+
+    private func ensureLocateIndex() {
+        guard let span = locateColumns() else { invalidateLocateIndex(); return }
+        if !locateSpanCurrent(span) || locateHashes.count != canvasRows {
+            rebuildLocateIndex(span)
+        }
+    }
+
+    private func rebuildLocateIndex(_ span: (x0: Int, x1: Int)) {
+        locateHashes = []
+        locateIndex = [:]
+        locateSaturated = []
+        locateKey = (width, pixelScale, span.x0, span.x1)
+        guard canvasRows > 0, canvas.count >= canvasRows * width * 4 else { return }
+        canvas.withUnsafeBufferPointer { cb in
+            for cy in 0..<canvasRows {
+                let h = rowSignature(cb, width: width, y: cy, x0: span.x0, x1: span.x1)
+                locateHashes.append(h)
+                attachLocate(h, at: cy)
+            }
+        }
+    }
+
+    /// Rows just written or painted. A gap, or a width/scale change, rebuilds the table.
+    private func refreshLocateRows(_ rows: Range<Int>) {
+        guard !rows.isEmpty else { return }
+        guard let span = locateColumns() else { invalidateLocateIndex(); return }
+        if !locateSpanCurrent(span) || locateHashes.count < rows.lowerBound {
+            rebuildLocateIndex(span)
+            return
+        }
+        var rebuild = false
+        canvas.withUnsafeBufferPointer { cb in
+            for cy in rows {
+                guard cy >= 0, cy < canvasRows else { continue }
+                let h = rowSignature(cb, width: width, y: cy, x0: span.x0, x1: span.x1)
+                if cy < locateHashes.count {
+                    if locateHashes[cy] == h { continue }
+                    detachLocate(locateHashes[cy], at: cy)
+                    locateHashes[cy] = h
+                } else if cy == locateHashes.count {
+                    locateHashes.append(h)
+                } else {
+                    rebuild = true
+                    return
+                }
+                attachLocate(h, at: cy)
+            }
+        }
+        if rebuild { rebuildLocateIndex(span) }
+    }
+
+    private func shrinkLocateRows(to keep: Int) {
+        guard locateHashes.count > keep else { return }
+        while locateHashes.count > keep {
+            let cy = locateHashes.count - 1
+            detachLocate(locateHashes[cy], at: cy)
+            locateHashes.removeLast()
+        }
+    }
+
+    private func attachLocate(_ hash: UInt64?, at row: Int) {
+        guard let hash, !locateSaturated.contains(hash) else { return }
+        locateIndex[hash, default: []].append(row)
+        if locateIndex[hash]!.count > 64 {
+            locateIndex[hash] = nil
+            locateSaturated.insert(hash)
+        }
+    }
+
+    private func detachLocate(_ hash: UInt64?, at row: Int) {
+        guard let hash, !locateSaturated.contains(hash), var rows = locateIndex[hash] else { return }
+        if let i = rows.lastIndex(of: row) { rows.remove(at: i) }
+        if rows.isEmpty { locateIndex[hash] = nil } else { locateIndex[hash] = rows }
+    }
+
+    /// Quantised FNV-1a over RGB in [x0, x1). Nil when the row is flat at that quantisation.
+    private func rowSignature(_ bytes: UnsafeBufferPointer<UInt8>, width: Int, y: Int, x0: Int, x1: Int) -> UInt64? {
+        let start = (y * width + x0) * 4
+        let end = (y * width + x1) * 4
+        guard y >= 0, x0 >= 0, x1 <= width, start >= 0, end <= bytes.count else { return nil }
+        var h: UInt64 = 0xcbf29ce484222325
+        var flat = true
+        let r0 = bytes[start] & 0xE0
+        let g0 = bytes[start + 1] & 0xE0
+        let b0 = bytes[start + 2] & 0xE0
+        var i = start
+        while i < end {
+            let r = bytes[i] & 0xE0, g = bytes[i + 1] & 0xE0, b = bytes[i + 2] & 0xE0
+            if flat && (r != r0 || g != g0 || b != b0) { flat = false }
+            h = (h ^ UInt64(r)) &* 0x100000001b3
+            h = (h ^ UInt64(g)) &* 0x100000001b3
+            h = (h ^ UInt64(b)) &* 0x100000001b3
+            i += 4
+        }
+        return flat ? nil : h
+    }
+
+    private func canvasRowMatches(_ f: PixelFrame, fy: Int, cy: Int, x0: Int, x1: Int) -> Bool {
+        let w = f.width
+        // Absolute row budget, not a share of the width. A one-digit change is a few pixels
+        // and must fail on a wide frame the same way it fails on a narrow one.
+        let rowThreshold = 2 * pixelScale
+        let tol = strictTolerance
+        var count = 0
+        return f.bytes.withUnsafeBufferPointer { fb in
+            canvas.withUnsafeBufferPointer { cb in
+                var i = (fy * w + x0) * 4
+                var j = (cy * w + x0) * 4
+                guard i >= 0, j >= 0, i + (x1 - x0) * 4 <= fb.count, j + (x1 - x0) * 4 <= cb.count else { return false }
+                for _ in x0..<x1 {
+                    if abs(Int(fb[i]) - Int(cb[j])) > tol
+                        || abs(Int(fb[i + 1]) - Int(cb[j + 1])) > tol
+                        || abs(Int(fb[i + 2]) - Int(cb[j + 2])) > tol {
+                        count += 1
+                        if count > rowThreshold { return false }
+                    }
+                    i += 4; j += 4
+                }
+                return true
+            }
+        }
     }
 
     /// The canvas and the reference agree again. The frames dropped while they did not
@@ -413,6 +667,7 @@ final class Stitcher: @unchecked Sendable {
         }
         let image = makeImage()
         canvas = [] // the image holds its own copy; long captures are large
+        invalidateLocateIndex()
         return image
     }
 
@@ -454,6 +709,7 @@ final class Stitcher: @unchecked Sendable {
         // The scrollbar knob sits somewhere else in every frame; written as is, a piece of it would
         // land in every stretch of the image. Its rows get the plain track instead.
         paintKnob(f, rows: rows, origin: origin)
+        refreshLocateRows((origin + rows.lowerBound)..<(origin + rows.upperBound))
     }
 
     private func paintKnob(_ f: PixelFrame, rows: Range<Int>, origin: Int) {

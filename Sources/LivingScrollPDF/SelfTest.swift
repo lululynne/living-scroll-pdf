@@ -824,6 +824,7 @@ enum SelfTest {
 
         recoveryDistance(check)
         hudStability(check)
+        honestHUD(check)
         wheelCalibration(check)
 
         // 8. Export round trip.
@@ -1081,14 +1082,15 @@ enum SelfTest {
 
         let up = ManualTracker.recoveryStatusText(.offset(screens: 3.21))
         let down = ManualTracker.recoveryStatusText(.offset(screens: -0.84))
-        check("recovery copy: still going up",
-              up == L("约 ↑ +3.2 屏 · 还要往上", "about ↑ +3.2 screens · keep going up"),
+        let near = ManualTracker.unconfirmedNearText()
+        check("recovery copy: still going up is an estimate, not a fact",
+              up == L("还没接上 · 约 ↑ +3.2 屏，继续往上", "not joined yet · about ↑ +3.2 screens, keep going up"),
               up ?? "-")
-        check("recovery copy: past zero go down",
-              down == L("约 ↓ -0.8 屏 · 滚过头了往下", "about ↓ -0.8 screens · too far, go down"),
-              down ?? "-")
-        check("recovery copy: arrived is the existing hold-still line",
-              ManualTracker.recoveryStatusText(.arrived) == L("到了，停一下", "There, hold still"), "")
+        check("recovery copy: at or past the break has no number and does not say 到了",
+              down == near && ManualTracker.recoveryStatusText(.arrived) == near
+              && ManualTracker.recoveryStatusText(.offset(screens: 0.3)) == near
+              && near.contains("继续往上") && !near.contains("到了") && !near.contains("往下") && !near.contains("数字偏了"),
+              "down=\(down ?? "-") near=\(near)")
         check("recovery copy: unknown has no invented number",
               ManualTracker.recoveryStatusText(.unknown) == nil, "")
 
@@ -1162,7 +1164,6 @@ enum SelfTest {
         let stats = ManualTracker.captureStats(frames: frames, shownPx: shown)
         let joinedLine = L("接上了 · ", "Joined · ") + stats
         let overLine = L("滚过头了，往回滚到还重叠的位置", "Too far, scroll back until the screens overlap")
-        let arrivedLine = ManualTracker.recoveryStatusText(.arrived) ?? ""
         let fallback = ManualTracker.recoveringFallback(frames: frames, shownPx: shown)
         let fallbackLiteral = L("滚过头了，往回滚到和上一帧重叠的地方才会接上 · 现在点完成会标成未完成 · ", "Scrolled too far. It joins only after you scroll back over the last frame · finishing now marks this capture incomplete · ") + stats
 
@@ -1271,31 +1272,28 @@ enum SelfTest {
         func distLine(_ screens: Double, gauge: ManualTracker.Gauge, now: Double) -> String {
             line(input(now: now, recovering: true, seen: true, distance: .offset(screens: screens), gauge: gauge), hold: &hyst)
         }
-        let far = distLine(0.2, gauge: .approaching(10), now: 0)
-        let held = line(input(now: 0.1, recovering: true, seen: true, distance: .arrived, gauge: .ready), hold: &hyst)
-        let near: [(Double, ManualTracker.Gauge)] = [
+        let noNumber = ManualTracker.unconfirmedNearText()
+        let closeSamples: [(Double, ManualTracker.Gauge)] = [
+            (0.2, .approaching(10)),
             (0.06, .ready),
             (0.09, .approaching(2)),
-            (ManualTracker.arrivedScreens * 2, .over(4)),
-            (0.06, .idle),
+            (0.3, .over(4)),
             (-0.09, .ready),
+            (-0.2, .over(15)),
         ]
-        let nearOK = near.allSatisfy { distLine($0.0, gauge: $0.1, now: 0.2) == arrivedLine }
-        let leftAt = ManualTracker.arrivedScreens * 2 + 0.02
-        let left = distLine(leftAt, gauge: .approaching(1), now: 1)
-        let notBack = distLine(0.06, gauge: .ready, now: 1.1)
-        let backIn = distLine(ManualTracker.arrivedScreens * 0.5, gauge: .idle, now: 1.2)
-        let down = distLine(-0.2, gauge: .over(15), now: 1.3)
-        check("manual hud: 到了 latches until twice arrivedScreens",
-              far == (ManualTracker.recoveryStatusText(.offset(screens: 0.2)) ?? "")
-              && held == arrivedLine && nearOK
-              && left == (ManualTracker.recoveryStatusText(.offset(screens: leftAt)) ?? "")
-              && notBack == (ManualTracker.recoveryStatusText(.offset(screens: 0.06)) ?? "")
-              && notBack != arrivedLine
-              && backIn == arrivedLine
-              && down == (ManualTracker.recoveryStatusText(.offset(screens: -0.2)) ?? "")
-              && down != overLine && !hyst.overLatched,
-              "far=\(far) held=\(held) left=\(left) notBack=\(notBack) back=\(backIn) down=\(down)")
+        let closeLines = closeSamples.map { distLine($0.0, gauge: $0.1, now: 0.2) }
+        let held = line(input(now: 0.1, recovering: true, seen: true, distance: .arrived, gauge: .ready), hold: &hyst)
+        let numbered = distLine(0.4, gauge: .approaching(1), now: 1)
+        let numberedWant = ManualTracker.recoveryStatusText(.offset(screens: 0.4)) ?? ""
+        let closeOK = closeLines.allSatisfy {
+            $0 == noNumber && !$0.contains("到了") && !$0.contains("数字偏了") && !$0.contains("往下") && !$0.contains("约")
+        }
+        check("manual hud: within 0.3 screens there is no number, no 到了 and no 数字偏了",
+              closeOK && held == noNumber && !held.contains("到了")
+              && numbered == numberedWant && numbered.contains("约 ↑") && numbered.contains("+0.4")
+              && !numbered.contains("到了") && !numbered.contains("数字偏了") && !numbered.contains("往下")
+              && numbered != overLine && !hyst.overLatched,
+              "close=\(closeLines) held=\(held) numbered=\(numbered)")
 
         var overHold = ManualTracker.HUDHold()
         let entered = line(input(now: 20, gauge: .over(12)), hold: &overHold)
@@ -1339,16 +1337,317 @@ enum SelfTest {
               "lost=\(lostLine) calm=\(calm)")
 
         var mismatchHold = ManualTracker.HUDHold()
-        let mismatchWant = ManualTracker.arrivedMismatchText()
+        let nearLine = ManualTracker.unconfirmedNearText()
         let arrivedHeld = line(input(now: 0.2, recovering: true, seen: true, distance: .arrived, lastWheel: 0.15), hold: &mismatchHold)
         let proved = line(input(now: 1.3, recovering: true, lost: true, seen: true, distance: .arrived, lastWheel: 0.2), hold: &mismatchHold)
         let stillLost = line(input(now: 1.5, recovering: true, lost: false, seen: true, distance: .arrived, lastWheel: 0.2), hold: &mismatchHold)
         let moved = line(input(now: 1.6, recovering: true, lost: true, seen: true, distance: .offset(screens: 0.4), lastWheel: 1.6), hold: &mismatchHold)
         let movedWant = ManualTracker.recoveryStatusText(.offset(screens: 0.4)) ?? ""
-        check("manual hud: arrived + still >1s + lost is 数字偏了; wheel moving restores the number",
-              arrivedHeld == arrivedLine && proved == mismatchWant && stillLost == mismatchWant
-              && moved == movedWant && moved != mismatchWant && moved != arrivedLine,
+        check("manual hud: a still lost frame near zero stays numberless; past 0.3 screens the estimate returns",
+              arrivedHeld == nearLine && proved == nearLine && stillLost == nearLine
+              && !proved.contains("数字偏了") && !proved.contains("到了")
+              && moved == movedWant && moved.contains("约 ↑") && !moved.contains("数字偏了"),
               "held=\(arrivedHeld) proved=\(proved) still=\(stillLost) moved=\(moved)")
+    }
+
+    /// Picture proof and the trace2 wheel sequence. The wheel's own number never says "到了".
+    private static func honestHUD(_ check: (String, Bool, String) -> Void) {
+        let w = 320, header = 40, footer = 60, bodyH = 400, contentH = 3200
+        let content = makeContent(width: w, height: contentH)
+        let headerRows = solid(width: w, height: header, rgb: (40, 80, 160), seed: 7)
+        let footerRows = solid(width: w, height: footer, rgb: (235, 235, 240), seed: 9)
+        func frame(offset: Int, source: [UInt8]? = nil) -> PixelFrame {
+            var bytes = headerRows
+            let pixels = source ?? content
+            var body = Array(pixels[(offset * w * 4)..<((offset + bodyH) * w * 4)])
+            let knob = offset * (bodyH - 60) / (contentH - bodyH)
+            for y in knob..<(knob + 60) { for x in (w - 8)..<(w - 2) { let i = (y * w + x) * 4; body[i] = 120; body[i + 1] = 120; body[i + 2] = 120 } }
+            for y in (bodyH - 50)..<(bodyH - 26) { for x in 250..<290 { let i = (y * w + x) * 4; body[i] = 30; body[i + 1] = 160; body[i + 2] = 90 } }
+            bytes += body
+            bytes += footerRows
+            return PixelFrame(width: w, height: header + bodyH + footer, bytes: bytes)
+        }
+
+        let placed = Stitcher()
+        var placeDetail = ""
+        for o in [0, 150, 300, 450] {
+            let r = placed.add(frame(offset: o))
+            let want: Stitcher.Outcome = o == 0 ? .first : .shifted(150)
+            if r != want { placeDetail = "offset \(o): \(r)" }
+        }
+        let rows = placed.canvasRows
+        let origin = placed.contentOrigin
+        let accepted = placed.acceptedFrames
+        let lost = placed.lostFrames
+        let early = frame(offset: 0)
+        let d = placed.locate(early)
+        let untouched = placed.canvasRows == rows && placed.contentOrigin == origin
+            && placed.acceptedFrames == accepted && placed.lostFrames == lost
+        check("locate: a frame above the written canvas has one negative distance and changes nothing",
+              placeDetail.isEmpty && d != nil && d! < 0 && untouched,
+              "place=\(placeDetail) d=\(d.map(String.init) ?? "nil") origin=\(origin) rows=\(rows) accepted=\(accepted)")
+        if let d {
+            let screens = Double(d) / Double(bodyH)
+            var hold = ManualTracker.HUDHold()
+            ManualTracker.integrateLocate(.found(d), rawAtTake: 0, now: 1, hold: &hold)
+            let text = ManualTracker.hudLine(
+                ManualTracker.HUDInput(now: 1, recovering: true, lost: true, wheelSeen: true,
+                                       distance: .offset(screens: 2), wheelRaw: 0, wheelRatio: 1, body: bodyH,
+                                       frames: accepted, shownPx: rows, lastWheelAt: 1),
+                hold: &hold)
+            let want = ManualTracker.locatedDownText(screens)
+            check("locate: that distance says 往下 and overrides a positive wheel estimate",
+                  text == want && text.contains("滚过头了") && text.contains("往下") && !text.contains("约 ↑") && !text.contains("到了")
+                  && hold.lastDistanceText == nil,
+                  text)
+        } else {
+            check("locate: that distance says 往下 and overrides a positive wheel estimate", false, "no distance")
+        }
+
+        var repeated = content
+        let copy = 900
+        for y in 0..<copy {
+            let n = w * 4
+            repeated.replaceSubrange((y + copy) * n..<((y + copy) * n + n), with: repeated[y * n..<(y * n + n)])
+        }
+        let ambiguous = Stitcher()
+        var ambDetail = ""
+        for o in stride(from: 0, through: 1200, by: 150) {
+            let r = ambiguous.add(frame(offset: o, source: repeated), expected: o == 0 ? nil : 150, tolerance: 0)
+            let want: Stitcher.Outcome = o == 0 ? .first : .shifted(150)
+            if r != want { ambDetail = "offset \(o): \(r)"; break }
+        }
+        let ambRows = ambiguous.canvasRows
+        let ambOrigin = ambiguous.contentOrigin
+        let ambAccepted = ambiguous.acceptedFrames
+        let ambLost = ambiguous.lostFrames
+        let amb = ambiguous.locate(frame(offset: 0, source: repeated))
+        check("locate: the same rows written twice give no distance and change nothing",
+              ambDetail.isEmpty && amb == nil
+              && ambiguous.canvasRows == ambRows && ambiguous.contentOrigin == ambOrigin
+              && ambiguous.acceptedFrames == ambAccepted && ambiguous.lostFrames == ambLost,
+              "place=\(ambDetail) d=\(amb.map(String.init) ?? "nil")")
+
+        let empty = Stitcher()
+        let sample = frame(offset: 0)
+        let first = empty.locateLost(sample, at: 0)
+        let soon = empty.locateLost(sample, at: 0.2)
+        let later = empty.locateLost(sample, at: 0.3)
+        check("locateLost: empty canvas is none, and a second call inside 0.3s does not search",
+              first == .none && soon == .skipped && later == .none
+              && empty.canvasRows == 0 && empty.acceptedFrames == 0 && empty.contentOrigin == 0,
+              "first=\(first) soon=\(soon) later=\(later)")
+
+        var tracker = ManualTracker(body: bodyH, pixelScale: 1)
+        tracker.wheel(deltaY: -500, precise: true, at: 0)
+        let shot = tracker.capture(at: 0.4)
+        let rawAtTake = tracker.raw
+        let expectedAtTake = shot?.expected
+        var pictureHold = ManualTracker.HUDHold()
+        ManualTracker.integrateLocate(.found(-200), rawAtTake: rawAtTake, now: 0.5, hold: &pictureHold)
+        tracker.wheel(deltaY: 140, precise: true, at: 0.6)
+        let afterMove = tracker.capture(at: 1.0)
+        check("a picture match does not rewrite raw, and capture() keeps the wheel",
+              rawAtTake == 500 && tracker.raw == 360 && tracker.wheelCredible
+              && shot?.expected == expectedAtTake && afterMove?.expected == tracker.estimate && tracker.estimate == 360
+              && pictureHold.picture?.pixels == -200 && pictureHold.picture?.rawAtTake == 500,
+              "raw0=\(rawAtTake) raw=\(tracker.raw) est=\(tracker.estimate) exp0=\(expectedAtTake.map(String.init) ?? "nil") exp=\(afterMove?.expected.map(String.init) ?? "nil")")
+
+        var hidden = ManualTracker.HUDHold()
+        ManualTracker.integrateLocate(.found(-Int(1.2 * Double(bodyH))), rawAtTake: 0, now: 0, hold: &hidden)
+        let fallback = ManualTracker.recoveringFallback(frames: 4, shownPx: 2400)
+        let keyed = ManualTracker.hudLine(
+            ManualTracker.HUDInput(now: 1, recovering: true, lost: true, wheelCredible: false, wheelSeen: true,
+                                   distance: .offset(screens: 2), wheelRaw: 0, wheelRatio: 1, body: bodyH,
+                                   frames: 4, shownPx: 2400, lastWheelAt: 1),
+            hold: &hidden)
+        check("a non-credible wheel keeps the long sentence even when the picture was found",
+              keyed == fallback && !keyed.contains("往下约") && hidden.picture != nil,
+              keyed)
+
+        pictureFollow(bodyH, check)
+        oneDigitRows(check)
+        sidewaysLocate(check)
+
+        let estimates = [800, 700, 600, 500, 400, 300, 200, 150, 120, 80, 40, 20, 10, 0, -5, -20, -40, -80, -20, 10, 40, 80, 200, 400, 800]
+        let body = 384
+        var hold = ManualTracker.HUDHold()
+        var bad = ""
+        var sawNear = false, sawFar = false, sawNegative = false
+        let noNumber = ManualTracker.unconfirmedNearText()
+        for (i, est) in estimates.enumerated() {
+            let screens = Double(est) / Double(body)
+            if screens <= 0.3 { sawNear = true }
+            if screens > 0.3 { sawFar = true }
+            if screens < 0 { sawNegative = true }
+            let distance: ManualTracker.RecoveryDistance = abs(screens) < ManualTracker.arrivedScreens ? .arrived : .offset(screens: screens)
+            let text = ManualTracker.hudLine(
+                ManualTracker.HUDInput(now: Double(i), recovering: true, lost: true, wheelSeen: true,
+                                       distance: distance, wheelRaw: Double(est), wheelRatio: 1, body: body,
+                                       frames: 4, shownPx: 2400, lastWheelAt: Double(i)),
+                hold: &hold)
+            let want = ManualTracker.recoveryStatusText(distance) ?? ""
+            if text != want || text.contains("到了") || text.contains("数字偏了") || text.contains("接上了") {
+                bad = "est=\(est) screens=\(screens) text=\(text)"
+                break
+            }
+            if screens <= 0.3, text != noNumber { bad = "near est=\(est) \(text)"; break }
+            if screens > 0.3, !text.contains("约 ↑") || text.contains("往下") { bad = "far est=\(est) \(text)"; break }
+        }
+        let edge = ManualTracker.hudLine(
+            ManualTracker.HUDInput(now: 1000, recovering: false, wheelSeen: true, frames: 4, shownPx: 2400),
+            hold: &hold)
+        let mid = ManualTracker.hudLine(
+            ManualTracker.HUDInput(now: 1000 + ManualTracker.joinedDwell - 0.05, recovering: false, frames: 4, shownPx: 2400),
+            hold: &hold)
+        let after = ManualTracker.hudLine(
+            ManualTracker.HUDInput(now: 1000 + ManualTracker.joinedDwell + 0.05, recovering: false, frames: 4, shownPx: 2400),
+            hold: &hold)
+        let joined = L("接上了 · ", "Joined · ") + ManualTracker.captureStats(frames: 4, shownPx: 2400)
+        check("embedded estimates through a gap never say 到了, and 接上了 comes once when it joins",
+              bad.isEmpty && estimates.count > 20 && sawNear && sawFar && sawNegative
+              && edge == joined && mid == joined && after == ManualTracker.captureStats(frames: 4, shownPx: 2400)
+              && !after.contains("接上了"),
+              bad.isEmpty ? "n=\(estimates.count) near=\(sawNear) far=\(sawFar) neg=\(sawNegative) edge=\(edge) after=\(after)" : bad)
+    }
+
+    /// The down sentence follows the wheel from the raw at the shot, and does not fall back to 约 ↑.
+    private static func pictureFollow(_ body: Int, _ check: (String, Bool, String) -> Void) {
+        func line(_ hold: inout ManualTracker.HUDHold, now: Double, raw: Double, distance: ManualTracker.RecoveryDistance) -> String {
+            ManualTracker.hudLine(
+                ManualTracker.HUDInput(now: now, recovering: true, lost: true, wheelSeen: true,
+                                       distance: distance, wheelRaw: raw, wheelRatio: 1, body: body,
+                                       frames: 4, shownPx: 2400, lastWheelAt: now),
+                hold: &hold)
+        }
+        var held = ManualTracker.HUDHold()
+        held.lastDistanceText = ManualTracker.recoveryStatusText(.offset(screens: 4))
+        ManualTracker.integrateLocate(.found(-440), rawAtTake: 0, now: 0, hold: &held)
+        let atShot = line(&held, now: 0.1, raw: 0, distance: .offset(screens: 4))
+        let followed = line(&held, now: 0.2, raw: 40, distance: .offset(screens: 4))
+        let wantShot = ManualTracker.locatedDownText(-440.0 / Double(body))
+        let wantFollow = ManualTracker.locatedDownText(-400.0 / Double(body))
+        check("往下 distance follows the wheel after the shot and does not revive 约 ↑",
+              held.lastDistanceText == nil && atShot == wantShot && followed == wantFollow
+              && atShot.contains("1.1") && followed.contains("1.0") && !followed.contains("约 ↑"),
+              "shot=\(atShot) follow=\(followed)")
+
+        var spin = ManualTracker(body: body, pixelScale: 1)
+        spin.wheel(deltaY: -40, precise: true, at: 0)
+        check("a negative wheel delta increases raw, which is the 往下 direction",
+              spin.raw == 40, "raw=\(spin.raw)")
+
+        var close = ManualTracker.HUDHold()
+        ManualTracker.integrateLocate(.found(-5), rawAtTake: 0, now: 0, hold: &close)
+        let tiny = line(&close, now: 0.1, raw: 0, distance: .offset(screens: 2))
+        check("inside 0.1 screen the 往下 line has no digit and no 0.0",
+              tiny == ManualTracker.numberlessDownText() && tiny.contains("往下") && !tiny.contains("0.0") && !tiny.contains("约"),
+              tiny)
+
+        var stay = ManualTracker.HUDHold()
+        ManualTracker.integrateLocate(.found(-400), rawAtTake: 0, now: 0, hold: &stay)
+        ManualTracker.integrateLocate(.none, rawAtTake: 0, now: 0.2, hold: &stay)
+        ManualTracker.integrateLocate(.skipped, rawAtTake: 0, now: 0.4, hold: &stay)
+        let duringMiss = line(&stay, now: 1.7, raw: 0, distance: .offset(screens: 4))
+        check("a miss keeps 往下 while the wheel has not reversed, and a skip does not clear it",
+              duringMiss == ManualTracker.locatedDownText(-1) && stay.picture?.missSince == 0.2 && !duringMiss.contains("约 ↑"),
+              duringMiss)
+        let aged = line(&stay, now: 2.2, raw: 0, distance: .offset(screens: 4))
+        check("a miss held for 2s asks for a slow roll and does not restore 约 ↑",
+              aged == ManualTracker.pictureNeutralText() && !aged.contains("约 ↑") && stay.picture?.neutral == true,
+              aged)
+
+        var back = ManualTracker.HUDHold()
+        ManualTracker.integrateLocate(.found(-400), rawAtTake: 0, now: 0, hold: &back)
+        let turned = line(&back, now: 0.3, raw: -0.15 * Double(body), distance: .offset(screens: 4))
+        check("reversing 0.15 screen drops the down proof",
+              turned == ManualTracker.pictureNeutralText() && back.picture?.neutral == true,
+              turned)
+
+        var contra = ManualTracker.HUDHold()
+        ManualTracker.integrateLocate(.found(-400), rawAtTake: 0, now: 0, hold: &contra)
+        ManualTracker.integrateLocate(.found(80), rawAtTake: 0, now: 0.4, hold: &contra)
+        let denied = line(&contra, now: 0.5, raw: 0, distance: .offset(screens: 4))
+        check("a positive picture match contradicts 往下 and does not restore 约 ↑",
+              denied == ManualTracker.pictureNeutralText() && !denied.contains("约 ↑"),
+              denied)
+
+        var rejoined = ManualTracker.HUDHold()
+        ManualTracker.integrateLocate(.found(-400), rawAtTake: 0, now: 0, hold: &rejoined)
+        let before = line(&rejoined, now: 1, raw: 0, distance: .unknown)
+        ManualTracker.dropPicture(&rejoined)
+        let edge = ManualTracker.hudLine(
+            ManualTracker.HUDInput(now: 2, recovering: false, wheelSeen: true, frames: 4, shownPx: 2400),
+            hold: &rejoined)
+        let joined = L("接上了 · ", "Joined · ") + ManualTracker.captureStats(frames: 4, shownPx: 2400)
+        check("dropping the picture on a join says 接上了 and does not keep 往下",
+              before.contains("往下") && edge == joined && !edge.contains("往下") && rejoined.picture == nil,
+              "before=\(before) edge=\(edge)")
+    }
+
+    /// Rows that differ by a few pixels inside one quantised bucket must not locate.
+    private static func oneDigitRows(_ check: (String, Bool, String) -> Void) {
+        for width in [623, 1500] {
+            let view = 220, contentH = 1000
+            var page = makeContent(width: width, height: contentH)
+            let patch = 4
+            for y in 0..<contentH {
+                for x in 24..<(24 + patch) {
+                    let i = (y * width + x) * 4
+                    page[i] = 0; page[i + 1] = 0; page[i + 2] = 0
+                }
+            }
+            var variant = page
+            for y in 0..<contentH {
+                for x in 24..<(24 + patch) {
+                    let i = (y * width + x) * 4
+                    variant[i] = 20
+                }
+            }
+            func frame(_ src: [UInt8], _ offset: Int) -> PixelFrame {
+                PixelFrame(width: width, height: view, bytes: Array(src[(offset * width * 4)..<((offset + view) * width * 4)]))
+            }
+            let st = Stitcher()
+            var detail = ""
+            for o in stride(from: 0, through: 560, by: 140) {
+                let r = st.add(frame(page, o))
+                let want: Stitcher.Outcome = o == 0 ? .first : .shifted(140)
+                if r != want { detail = "offset \(o): \(r)"; break }
+            }
+            let exact = detail.isEmpty ? st.locate(frame(page, 0)) : nil
+            let near = detail.isEmpty ? st.locate(frame(variant, 0)) : nil
+            check("one-digit rows at width \(width) do not locate, and the real earlier frame still does",
+                  detail.isEmpty && exact != nil && exact! < 0 && near == nil,
+                  "place=\(detail) exact=\(exact.map(String.init) ?? "nil") near=\(near.map(String.init) ?? "nil")")
+        }
+    }
+
+    /// After a sideways re-anchor, locate shifts the raw frame the same way add does.
+    private static func sidewaysLocate(_ check: (String, Bool, String) -> Void) {
+        let pw = 360, view = 500, contentH = 1600
+        let page = makeContent(width: pw, height: contentH)
+        func shot(_ o: Int, right: Int) -> PixelFrame {
+            var b = [UInt8](repeating: 255, count: pw * view * 4)
+            for y in 0..<view {
+                for x in 0..<pw {
+                    let sx = x - right
+                    guard sx >= 0 else { continue }
+                    let i = (y * pw + x) * 4, j = ((o + y) * pw + sx) * 4
+                    b[i] = page[j]; b[i + 1] = page[j + 1]; b[i + 2] = page[j + 2]; b[i + 3] = page[j + 3]
+                }
+            }
+            return PixelFrame(width: pw, height: view, bytes: b)
+        }
+        let st = Stitcher()
+        var outcomes: [Stitcher.Outcome] = []
+        for (o, r) in [(0, 0), (200, 0), (400, 0), (400, 7), (600, 7), (800, 7)] {
+            outcomes.append(st.add(shot(o, right: r)))
+        }
+        let shifted = st.locate(shot(0, right: 7))
+        let plain = st.locate(shot(0, right: 0))
+        check("locate applies xOffset, so a recentred earlier frame matches and an unshifted one does not",
+              st.xOffset != 0 && st.lostFrames == 0 && shifted != nil && shifted! < 0 && plain == nil,
+              "x=\(st.xOffset) outcomes=\(outcomes) shifted=\(shifted.map(String.init) ?? "nil") plain=\(plain.map(String.init) ?? "nil")")
     }
 
     /// Mouse wheel pointDelta, poisoned-ratio samples, top/bottom absorb, overshoot recovery.

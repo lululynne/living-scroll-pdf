@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import os
 import ScreenCaptureKit
 
 /// Follows one window: captures the picked region of that window only (occluding windows
@@ -40,6 +41,11 @@ final class CaptureSession {
     private var recovering = false
     /// Memory for the one status line. The session does not choose the sentence.
     private var hudHold = ManualTracker.HUDHold()
+    /// Frames handed to the stitch queue and not yet inside `add`. A locate that sees
+    /// this above zero does not search, so a waiting frame is not stuck behind it.
+    private let framesWaiting = OSAllocatedUnfairLock(initialState: 0)
+    /// Bumped for every judged frame. A locate result from an older frame is ignored.
+    private var locateGeneration = 0
     /// Errors stay until a frame is judged after `urgentUntil`. The stats line must not cover them.
     private var urgentStatus: String?
     /// Frames arrive every tick, so a notice needs a minimum time on the bar or nobody can read it.
@@ -209,8 +215,14 @@ final class CaptureSession {
             let stitcher = self.stitcher
             let expected = auto ? pacer.expected : request?.expected
             let tolerance = auto ? max(16 * stitcher.pixelScale, frame.height * 12 / 100) : (request?.tolerance ?? 0)
+            let manual = !auto
+            locateGeneration += 1
+            let generation = locateGeneration
+            let waiting = framesWaiting
+            waiting.withLock { $0 += 1 }
             let (outcome, height, frames, dropped, edges, share, unjoined) = await withCheckedContinuation { cont in
                 work.async {
+                    waiting.withLock { $0 -= 1 }
                     let o = stitcher.add(frame, expected: expected, tolerance: tolerance)
                     cont.resume(returning: (o, stitcher.canvasRows, stitcher.acceptedFrames, stitcher.lostFrames, stitcher.edgeBands, stitcher.movingShare, stitcher.needsRecovery))
                 }
@@ -230,6 +242,27 @@ final class CaptureSession {
                 let same = lastSeenFrame.map { $0.width == frame.width && $0.height == frame.height && $0.bytes == frame.bytes } ?? false
                 tracker?.noteJudgedFrame(identical: same, at: now)
                 lastSeenFrame = frame
+            }
+            // Picture offset is display-only. It is not written into `raw`, so capture() and
+            // the acceptance window stay on the wheel. A search runs after `add` has already
+            // returned, and steps aside when another frame is waiting.
+            let lostManual = manual && outcome == .lost
+            if !lostManual {
+                ManualTracker.dropPicture(&hudHold)
+            } else if let request, let tracker, tracker.wheelCredible, tracker.wheelSeen {
+                let take = request.raw
+                let searchedAt = now
+                work.async {
+                    let busy = waiting.withLock { $0 > 0 }
+                    let verdict: Stitcher.LocateVerdict = busy ? .skipped : stitcher.locateLost(frame, at: searchedAt)
+                    Task { @MainActor [weak self] in
+                        guard let self, self.locateGeneration == generation, !self.finishing else { return }
+                        ManualTracker.integrateLocate(verdict, rawAtTake: take, now: self.now, hold: &self.hudHold)
+                        if self.recovering {
+                            self.publishHUD(lost: true, nonzeroShift: false)
+                        }
+                    }
+                }
             }
             // Manual mode: the seam line and overlap limits follow the part of the view that scrolls.
             if case .shifted(let d) = outcome, d != 0 { tracker?.body = max(64, Int((Double(frame.height) * share).rounded())) }
@@ -285,6 +318,9 @@ final class CaptureSession {
             wheelCredible: tracker?.wheelCredible ?? true,
             wheelSeen: tracker?.wheelSeen ?? false,
             distance: tracker?.recovery(at: now) ?? .unknown,
+            wheelRaw: tracker?.raw ?? 0,
+            wheelRatio: tracker?.ratio ?? 1,
+            body: max(1, tracker?.body ?? Int(sourceRect.height * CGFloat(scale))),
             gauge: tracker?.gauge ?? .idle,
             frames: lastStats.frames,
             shownPx: shown,

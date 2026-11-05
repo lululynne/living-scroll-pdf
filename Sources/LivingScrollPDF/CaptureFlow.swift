@@ -158,8 +158,6 @@ struct ManualTracker {
     private var restRaw = 0.0
     /// A page that has not moved, after the wheel has been still this long, absorbed those events.
     static let absorbStill = 0.25
-    /// Recovery "arrived" is only trusted after the wheel has been still this long and the frame is still lost.
-    static let arrivedVerifyStill = 1.0
     private var windowMisses = 0
     /// Last frame taken while past `maxShift`.
     private var lastLook = -Double.infinity
@@ -303,15 +301,16 @@ struct ManualTracker {
     }
 
     /// Signed distance from the last placed frame, in screens of `body`. Positive is later
-    /// content (still need to go up); negative is earlier (past the break, go down). Nil-origin
-    /// copy is `.unknown` when there is no credible wheel.
+    /// content (still need to go up); negative is earlier. A negative estimate is not proof
+    /// the page went past the break — the wheel can under-count — so the bar does not say
+    /// "go down" from this number alone.
     enum RecoveryDistance: Equatable {
         case unknown
         case arrived
         case offset(screens: Double)
     }
 
-    /// Closer than this, the bar says hold still instead of printing 0.0.
+    /// Closer than this, the distance is `.arrived`. The bar prints no number either way.
     static let arrivedScreens = 0.05
 
     static func recoveryDistance(estimate: Int, body: Int, wheelActive: Bool, wheelCredible: Bool) -> RecoveryDistance {
@@ -325,26 +324,61 @@ struct ManualTracker {
         Self.recoveryDistance(estimate: estimate, body: body, wheelActive: active(at: t), wheelCredible: wheelCredible)
     }
 
-    /// Status-bar copy. `.unknown` is nil so the caller keeps the existing recovering sentence.
+    /// Unconfirmed wheel copy. `.unknown` is nil so a quiet wheel keeps the last sentence.
+    /// Above 0.3 screens and still positive: an approximate "keep going up". At or below 0.3,
+    /// including a negative estimate, there is no number and no "到了".
     static func recoveryStatusText(_ d: RecoveryDistance) -> String? {
         switch d {
         case .unknown:
             return nil
         case .arrived:
-            return L("到了，停一下", "There, hold still")
+            return unconfirmedNearText()
         case .offset(let screens):
+            guard screens > 0.3 else { return unconfirmedNearText() }
             let n = String(format: "%+.1f", screens)
-            if screens > 0 {
-                return L("约 ↑ \(n) 屏 · 还要往上", "about ↑ \(n) screens · keep going up")
-            }
-            return L("约 ↓ \(n) 屏 · 滚过头了往下", "about ↓ \(n) screens · too far, go down")
+            return L("还没接上 · 约 ↑ \(n) 屏，继续往上", "not joined yet · about ↑ \(n) screens, keep going up")
         }
     }
 
-    /// Estimate said arrived, the wheel has been still, and the frame is still lost.
-    static func arrivedMismatchText() -> String {
-        L("数字偏了，这里还接不上 · 慢慢上下滚，接上会提示",
-          "The number is off, it still doesn't join here · scroll slowly up and down, it'll say when it joins")
+    /// Wheel estimate is at the break, past it, or too close to print. The page has not joined.
+    static func unconfirmedNearText() -> String {
+        L("还没接上 · 继续往上，接上会提示", "not joined yet · keep going up, it'll say when it joins")
+    }
+
+    /// The lost frame was found above the last placed frame. `screens` is negative.
+    static func locatedDownText(_ screens: Double) -> String {
+        let n = String(format: "%.1f", abs(screens))
+        return L("滚过头了 · 往下约 \(n) 屏", "too far · about \(n) screens down")
+    }
+
+    /// Picture says down, but the live distance is inside 0.1 screen. No digit, so it cannot say 0.0.
+    static func numberlessDownText() -> String {
+        L("滚过头了 · 往下，接上会提示", "too far · scroll down, it'll say when it joins")
+    }
+
+    /// The down proof was reversed, contradicted, or unmatched for too long.
+    static func pictureNeutralText() -> String {
+        L("还没接上 · 慢慢上下滚，接上会提示", "not joined yet · roll slowly up and down, it'll say when it joins")
+    }
+
+    /// Closer than this, a picture distance prints no number.
+    static let pictureNumberFloor = 0.1
+    /// Wheel movement back toward earlier content, in screens of `body`, that drops a down proof.
+    static let pictureReverseScreens = 0.15
+    /// How long a miss may keep the down sentence before the bar asks for a slow roll.
+    static let pictureMissLimit = 2.0
+
+    /// Display-only offset from one canvas match. `raw` of the tracker is not this.
+    struct PictureHold: Equatable {
+        /// Signed pixels from the last placed frame to the matched frame. Negative is earlier content.
+        var pixels: Int
+        /// `Capture.raw` at the moment the frame was requested, before later wheel events.
+        var rawAtTake: Double
+        var provedAt: Double
+        /// First `.none` after the proof. Nil while the last search still agreed, or was skipped.
+        var missSince: Double?
+        /// Latched: reverse, a positive match, or a miss that outlasted `pictureMissLimit`.
+        var neutral: Bool
     }
 
     /// How long `.over` stays up once it appears, so a stats write cannot flicker it off.
@@ -363,13 +397,38 @@ struct ManualTracker {
         /// leave "接上了" on the bar.
         var joinedLatched = false
         var wasRecovering = false
-        var arrivedLatched = false
-        /// Recovery said "arrived" and a still, lost frame proved the number was wrong.
-        var mismatchLatched = false
-        /// Last distance sentence while recovering. A quiet wheel keeps it.
+        /// Last unconfirmed distance sentence while recovering. A quiet wheel keeps it.
+        /// A picture proof clears it, so a quiet wheel cannot bring back an "约 ↑" the picture already denied.
         var lastDistanceText: String? = nil
+        /// Canvas match used only for the sentence. Nil when nothing is lost, or auto-scroll is on.
+        var picture: PictureHold? = nil
 
         func dwells(at _: Double) -> Bool { overLatched || joinedLatched }
+    }
+
+    /// Fold one locate result into the picture hold. Does not read or write the wheel total.
+    /// A negative `found` is the only proof of "往下". A positive one, while a proof is up, contradicts it.
+    static func integrateLocate(_ verdict: Stitcher.LocateVerdict, rawAtTake: Double, now: Double, hold: inout HUDHold) {
+        switch verdict {
+        case .skipped:
+            break
+        case .found(let px) where px < 0:
+            hold.picture = PictureHold(pixels: px, rawAtTake: rawAtTake, provedAt: now, missSince: nil, neutral: false)
+            hold.lastDistanceText = nil
+        case .found:
+            if hold.picture != nil {
+                hold.picture?.neutral = true
+                hold.lastDistanceText = nil
+            }
+        case .none:
+            if hold.picture != nil, hold.picture?.neutral != true, hold.picture?.missSince == nil {
+                hold.picture?.missSince = now
+            }
+        }
+    }
+
+    static func dropPicture(_ hold: inout HUDHold) {
+        hold.picture = nil
     }
 
     struct HUDInput: Equatable {
@@ -383,6 +442,11 @@ struct ManualTracker {
         var wheelCredible: Bool = true
         var wheelSeen: Bool = false
         var distance: RecoveryDistance = .unknown
+        /// Wheel total and scale, so a picture distance can follow the wheel between frames.
+        /// `body` is the scrolling band in pixels. Defaults keep older call sites on the wheel sentence.
+        var wheelRaw: Double = 0
+        var wheelRatio: Double = 1
+        var body: Int = 1
         var gauge: Gauge = .idle
         var frames: Int
         var shownPx: Int
@@ -406,9 +470,13 @@ struct ManualTracker {
     /// Approaching / ready used to be rewritten every tick, and every moved frame added
     /// "刚接上", so the bar flickered. Those are gone. `.over` stays at least `overDwell`
     /// seconds. "接上了" is only the falling edge of `recovering`, held `joinedDwell`
-    /// seconds. While recovering the bar is the signed distance: a wheel that goes quiet
-    /// keeps the last sentence, and only a non-credible wheel — or no wheel at all — uses
-    /// the long sentence. "到了" latches until the distance is past twice `arrivedScreens`.
+    /// seconds. While recovering, a positive wheel estimate above 0.3 screens is an
+    /// approximation; at or below that, and for every negative estimate, there is no number.
+    /// A picture proof of earlier content says "往下" and follows the wheel from the raw
+    /// at the shot. It is not replaced by an older "约 ↑". Inside 0.1 screen the digits drop.
+    /// A reverse of 0.15 screen, a positive match, or a miss held for 2 s asks for a slow roll.
+    /// A wheel that goes quiet keeps the last unconfirmed sentence only when no picture is up.
+    /// A non-credible wheel — or no wheel at all — uses the long sentence, picture included.
     static func hudLine(_ input: HUDInput, hold: inout HUDHold) -> String {
         if let urgent = input.urgent { return urgent }
         let stats = captureStats(frames: input.frames, shownPx: input.shownPx)
@@ -434,8 +502,7 @@ struct ManualTracker {
             hold.joinedUntil = input.now + joinedDwell
             hold.joinedLatched = true
             hold.lastDistanceText = nil
-            hold.arrivedLatched = false
-            hold.mismatchLatched = false
+            hold.picture = nil
         }
         hold.wasRecovering = input.recovering
         if hold.joinedLatched && input.now >= hold.joinedUntil {
@@ -465,48 +532,38 @@ struct ManualTracker {
         // No wheel at all is the same sentence: there is no distance to keep.
         if !input.wheelCredible {
             hold.lastDistanceText = nil
-            hold.arrivedLatched = false
-            hold.mismatchLatched = false
             return fallback
         }
         if !input.wheelSeen { return fallback }
-        if let text = distanceSentence(input, hold: &hold) {
+        if var pic = hold.picture {
+            let body = max(1, input.body)
+            let moved = (input.wheelRaw - pic.rawAtTake) * input.wheelRatio
+            let reversed = moved <= -Double(body) * pictureReverseScreens
+            let stale = pic.missSince.map { input.now - $0 >= pictureMissLimit } ?? false
+            if reversed || stale || pic.neutral {
+                pic.neutral = true
+                hold.picture = pic
+                hold.lastDistanceText = nil
+                return pictureNeutralText()
+            }
+            hold.picture = pic
+            let screens = (Double(pic.pixels) + moved) / Double(body)
+            // Well past the break again: the picture no longer says which way.
+            if screens > 0.3 {
+                pic.neutral = true
+                hold.picture = pic
+                hold.lastDistanceText = nil
+                return pictureNeutralText()
+            }
+            if screens < -pictureNumberFloor { return locatedDownText(screens) }
+            return numberlessDownText()
+        }
+        if let text = recoveryStatusText(input.distance) {
             hold.lastDistanceText = text
             return text
         }
         // Wheel went quiet (`active` is false, so the distance is `.unknown`). Keep the last figure.
         if let last = hold.lastDistanceText { return last }
         return fallback
-    }
-
-    /// "到了" enters under `arrivedScreens` and leaves only past twice that, so the boundary does not chatter.
-    /// Arrived plus a still wheel and a still-lost frame is a lie: the number is off.
-    private static func distanceSentence(_ input: HUDInput, hold: inout HUDHold) -> String? {
-        let still = input.now - input.lastWheelAt
-        if still < arrivedVerifyStill { hold.mismatchLatched = false }
-        switch input.distance {
-        case .unknown:
-            // Past the two seconds of a live wheel the number is gone, but "到了" must not stay up on a lost frame.
-            guard hold.arrivedLatched, input.lost, still > arrivedVerifyStill else { return nil }
-            return arrivedLine(lost: true, still: still, hold: &hold)
-        case .arrived:
-            hold.arrivedLatched = true
-            return arrivedLine(lost: input.lost, still: still, hold: &hold)
-        case .offset(let screens):
-            if hold.arrivedLatched {
-                if abs(screens) > arrivedScreens * 2 { hold.arrivedLatched = false }
-            } else if abs(screens) < arrivedScreens {
-                hold.arrivedLatched = true
-            }
-            if hold.arrivedLatched { return arrivedLine(lost: input.lost, still: still, hold: &hold) }
-            hold.mismatchLatched = false
-            return recoveryStatusText(.offset(screens: screens))
-        }
-    }
-
-    private static func arrivedLine(lost: Bool, still: Double, hold: inout HUDHold) -> String {
-        if lost && still > arrivedVerifyStill { hold.mismatchLatched = true }
-        if hold.mismatchLatched { return arrivedMismatchText() }
-        return recoveryStatusText(.arrived) ?? arrivedMismatchText()
     }
 }
