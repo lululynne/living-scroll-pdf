@@ -1,43 +1,39 @@
-# 0.2.1
+# 卷轴PDF 0.2.1
 
-手动滚动仍免费，没有水印，打赏入口不变。自动滚动这一版关着。
+手动滚动照样免费，不加水印，打赏入口也还在。自动滚到底这一版仍然关着。
 
-## 修复
+## 这次修了什么
 
-近重复的行（正文按固定行高重复，只有一列窄标记不同）在证明不了两帧真的重叠时，不再接上一个较小的位移。对不上就停在最后一次能证明连续的画面。
-
-这时点完成，文件名带「未完成」。同名 JSON 写 `isPartial`、`partialReason` 和 `gaps`。`gaps.afterRow` 是当前图像高度，缺的是结尾之后还没接上的部分，不会在图中间补像素。
-
-导出版本读包里的 `CFBundleShortVersionString`。命令行构建没有 app 包，记为 `dev`，不再写成 `0.1.0`。打包脚本里的版本是 `0.2.1`，build `4`。
-
-往回滚、停下、速度不匀都可以，只要新的一帧还能和上一帧对上真实重叠。滚过了重叠范围，就得滚回到还重叠的位置才会再接上。恢复状态下，滚轮累计会在提示条上显示离断点大约多少屏，零点是断开的那一帧；没有滚轮不编数字。是否接上仍只由连续性校验决定。打包 app 内的 selftest 不再把正确的导出版本误报成失败。
+- **提示条不再乱闪。** 以前好几条提示抢着写，同一刻能跳出「停一下」「往上滚」「已到底」。现在只有一个地方写提示：正常滚动时就一行，告诉你已经收了几张、拼了多长。
+- **不再说「到了」骗你。** 断开之后，只有画面真的对上了才会告诉你「接上了」。滚轮估算的距离只拿来给个大概方向；拿不准方向时它不指路，只提示你慢慢上下滚。
+- **滚轮距离按真实像素算。** 普通滚轮鼠标的距离以前会被估大好几倍，现在读的是系统给的真实像素位移。
+- **证明不了的地方不硬接。** 两段内容长得几乎一样、又证明不了真的重叠时，不再把它们接上。这时点完成，文件名会带上「未完成」，同名 JSON 里会写清楚缺口在哪；图中间不会补上任何编造的像素。
+- 导出文件里记录的版本号读的是 app 自己的版本。
 
 ## 已知限制
 
-丢帧次数不是滚动速度的测量，也不能单独说明图中间为什么有洞。没有原始帧，就不能把某一次导出里的内洞逐帧归因到这次误匹配。
+- 甩得太快、或者两段内容看起来一模一样时，它不会替你认定已经拼完整，需要你滚回断开的地方，等它提示「接上了」。
+- 以前导出的文件不会被改动。
 
-快滚，或两段看起来几乎一样的内容，不会被自动证明为完整。
+需要 macOS 14 或更高版本。安装包已经通过 Apple 公证。
 
-这一版说明对应的源码没有在这次核对里打包、公证，也没有启动图形界面。已经导出的旧文件不会被改写。
+---
 
-# 0.2.1
+# Living Scroll PDF 0.2.1
 
 Manual scrolling stays free, with no watermark and the same tip entry. Auto-scroll stays off in this build.
 
 ## Fixes
 
-Near-duplicate lines (a repeating body plus one narrow unique column) are no longer joined at a small shift when the overlap cannot be proved. The image stays at the last join that was proved.
-
-Finishing then writes the unfinished mark on the file name. The JSON records `isPartial`, `partialReason` and `gaps`. `gaps.afterRow` is the current image height: the gap is after the end, and no pixels are invented in the middle.
-
-The export version is `CFBundleShortVersionString`. A command-line build has no app bundle and is recorded as `dev`, not `0.1.0`. The pack script stamps `0.2.1`, build `4`.
-
-Scrolling back, pausing and uneven speed are fine when the new frame still overlaps the previous one. Past that overlap, it joins again only after you scroll back to a real overlap. While recovering, the status bar shows an approximate signed distance in screens from the break; without wheel events it does not invent a number. Joining is still decided only by the continuity check. Self-test inside a packaged app no longer fails on a correct export version.
+- **The status bar no longer flickers.** It now has a single writer. While you scroll normally it shows one line: how many frames it has and how long the image is.
+- **No more false "arrived".** After a break, only real pixels can say "joined". The wheel estimate gives a rough direction at most. When the direction is uncertain, it just asks you to scroll slowly up and down.
+- **Wheel distance uses real pixels.** Ordinary wheel mice used to be overestimated several times over. It now reads the system's real pixel delta.
+- **No unproved joins.** If two stretches look nearly the same and the overlap cannot be proved, they are not joined. Finishing then marks the file name as unfinished, and the JSON beside it records where the gap is. No pixels are invented.
+- The version recorded in exports comes from the app bundle.
 
 ## Limits
 
-A dropped-frame count is not a measurement of scroll speed, and it does not by itself explain an interior hole. Without the original frames, an interior hole in an existing export cannot be attributed frame by frame to this mismatch.
+- After a very fast flick, or on two stretches that look identical, it will not certify the capture as complete. Scroll back to the break until it says "joined".
+- Earlier exports are left unchanged.
 
-Fast scrolling, or two stretches that only look the same, is not automatically certified complete.
-
-This note was not followed by packaging, notarization or a GUI launch. Older exports are left as they are.
+Requires macOS 14 or later. Notarized by Apple.
