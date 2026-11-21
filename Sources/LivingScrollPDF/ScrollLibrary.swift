@@ -42,6 +42,11 @@ struct ScrollEntry: Codable, Identifiable {
 /// The public PNG/PDF may be redacted. The editable original and its layers live together
 /// in a private project directory, away from the files people send to others.
 final class ScrollLibrary {
+    enum MetadataChange {
+        case renamed(id: UUID, previousRevision: UUID, revision: UUID, name: String)
+        case moved(ids: Set<UUID>, category: UUID?)
+    }
+
     static let shared: ScrollLibrary = {
         let folders = Exporter.outputFolders
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -113,10 +118,11 @@ final class ScrollLibrary {
         try renameItem(staged, to: file)
     }
 
-    private func writeIndex(_ index: Index) throws {
+    private func writeIndex(_ index: Index, change: MetadataChange? = nil) throws {
         try replace(JSONEncoder().encode(index), at: indexURL)
         DispatchQueue.main.async {
-            NotificationCenter.default.post(name: .scrollLibraryDidChange, object: self)
+            NotificationCenter.default.post(name: .scrollLibraryDidChange, object: self,
+                                            userInfo: change.map { ["metadataChange": $0] })
         }
     }
 
@@ -450,12 +456,12 @@ final class ScrollLibrary {
         }.sorted { $0.0 == $1.0 ? $0.1.lastPathComponent > $1.1.lastPathComponent : $0.0 > $1.0 }
         for (_, url) in latest {
             guard let revision = UUID(uuidString: String(url.lastPathComponent.dropLast(".edit.json".count))) else { continue }
-            if let document = try document(at: url, revision: revision, width: width, height: height, id: id) { return document }
+            if let document = try document(at: url, revision: revision, id: id, dimensions: (width, height)) { return document }
         }
         return nil
     }
 
-    private func document(at url: URL, revision: UUID, width: Int, height: Int, id: UUID?) throws -> EditDocument? {
+    private func document(at url: URL, revision: UUID, id: UUID?, dimensions: (Int, Int)? = nil) throws -> EditDocument? {
         guard let kind = try type(of: url) else { return nil }
         guard kind == .typeRegular else { throw LibraryError.invalidLocation }
         let data = try Data(contentsOf: url), decoder = JSONDecoder()
@@ -463,8 +469,9 @@ final class ScrollLibrary {
             throw LibraryError.version
         }
         guard var doc = try? decoder.decode(EditDocument.self, from: data), doc.version == 1,
-              id == nil || doc.id == id, doc.record.pixelWidth == width, doc.record.pixelHeight == height,
+              id == nil || doc.id == id,
               doc.revision == nil || doc.revision == revision else { return nil }
+        if let dimensions, (doc.record.pixelWidth, doc.record.pixelHeight) != dimensions { return nil }
         doc.revision = revision
         return doc
     }
@@ -500,14 +507,32 @@ final class ScrollLibrary {
     }
 
     @discardableResult
-    func addCategory(_ name: String) throws -> ScrollCategory {
+    func addCategory(_ name: String, assigning ids: [UUID] = []) throws -> ScrollCategory {
         try withProjectLock {
             var index = try indexLocked()
             let category = ScrollCategory(id: UUID(), name: try categoryName(name, in: index))
             index.categories.append(category)
-            try writeIndex(index)
+            try writeCategory(category.id, for: ids, in: index)
             return category
         }
+    }
+
+    func setCategory(ids: [UUID], category: UUID?) throws {
+        guard !ids.isEmpty else { return }
+        try withProjectLock {
+            let index = try indexLocked()
+            if let category, !index.categories.contains(where: { $0.id == category }) { throw LibraryError.categoryGone }
+            try writeCategory(category, for: ids, in: index)
+        }
+    }
+
+    private func writeCategory(_ category: UUID?, for ids: [UUID], in previous: Index) throws {
+        var index = previous
+        let selected = Set(ids)
+        let positions = index.entries.indices.filter { selected.contains(index.entries[$0].id) }
+        guard positions.count == selected.count else { throw LibraryError.projectGone }
+        for i in positions { index.entries[i].categoryID = category }
+        try writeIndex(index, change: selected.isEmpty ? nil : .moved(ids: selected, category: category))
     }
 
     func renameCategory(_ id: UUID, to name: String) throws {
@@ -571,6 +596,28 @@ final class ScrollLibrary {
         project(entry).appendingPathComponent(entry.revision.uuidString + ".edit.json")
     }
 
+    func rename(id: UUID, to name: String) throws {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw LibraryError.emptyName }
+        try withProjectLock {
+            let index = try indexLocked()
+            guard let i = index.entries.firstIndex(where: { $0.id == id }) else { throw LibraryError.projectGone }
+            var entry = index.entries[i]
+            try checkProjectFolder(entry)
+            guard var doc = try document(at: sidecar(entry), revision: entry.revision, id: id) else {
+                throw LibraryError.recordMismatch
+            }
+            let clean = Exporter.fileStem(for: doc.record, name: name)
+            guard clean != doc.name || clean != entry.name else { return }
+            let previous = entry.revision
+            entry.name = clean
+            entry.revision = UUID()
+            doc.name = clean
+            doc.revision = entry.revision
+            try writeRevision(doc, entry: entry, at: i, in: index,
+                              change: .renamed(id: id, previousRevision: previous, revision: entry.revision, name: clean))
+        }
+    }
+
     func originalURL(for id: UUID) throws -> URL {
         guard let entry = try readIndex().entries.first(where: { $0.id == id }) else { throw LibraryError.projectGone }
         try checkProjectFolder(entry)
@@ -615,9 +662,14 @@ final class ScrollLibrary {
     }
 
     @discardableResult
-    func save(_ document: EditDocument, original: CGImage, categoryID: UUID?) throws -> EditDocument {
+    func save(_ document: EditDocument, original: CGImage, categoryID: UUID?, preservingCategory: Bool = false) throws -> EditDocument {
         try withProjectLock {
-            try save(document, original: original, categoryID: categoryID, index: indexLocked())
+            let index = try indexLocked()
+            // An editor saving only its layers or name must keep a concurrent library move.
+            if preservingCategory, let entry = index.entries.first(where: { $0.id == document.id }) {
+                return try save(document, original: original, categoryID: entry.categoryID, index: index)
+            }
+            return try save(document, original: original, categoryID: categoryID, index: index)
         }
     }
 
@@ -664,12 +716,8 @@ final class ScrollLibrary {
         document.revision = entry.revision
         let folder = project(entry)
         let source = folder.appendingPathComponent("original.png")
-        let data = try JSONEncoder().encode(document)
-        let next = sidecar(entry)
         try checkProjectFolder(entry, creating: old == nil)
-        var filesReady = false
-        do {
-            try replace(data, at: next)
+        try writeRevision(document, entry: entry, at: position, in: index) {
             if old == nil {
                 let staged = folder.appendingPathComponent(".original.pending")
                 if let copySource {
@@ -686,16 +734,27 @@ final class ScrollLibrary {
             } else if try type(of: source) != .typeRegular {
                 throw LibraryError.originalGone
             }
+        }
+        return document
+    }
+
+    private func writeRevision(_ document: EditDocument, entry: ScrollEntry, at position: Int?, in previous: Index,
+                               change: MetadataChange? = nil, prepareOriginal: () throws -> Void = {}) throws {
+        var index = previous
+        let next = sidecar(entry), old = position.map { index.entries[$0] }
+        var filesReady = false
+        do {
+            try replace(JSONEncoder().encode(document), at: next)
+            try prepareOriginal()
             filesReady = true
             if let position { index.entries[position] = entry } else { index.entries.append(entry) }
-            try writeIndex(index)
+            try writeIndex(index, change: change)
         } catch {
             if old != nil { try? fm.removeItem(at: next) }
-            else if !filesReady { try? fm.removeItem(at: folder) }
+            else if !filesReady { try? fm.removeItem(at: project(entry)) }
             throw error
         }
         if let old { try? fm.removeItem(at: sidecar(old)) }
-        return document
     }
 
     func load(_ id: UUID) throws -> (document: EditDocument, original: CGImage, categoryID: UUID?) {
@@ -707,7 +766,7 @@ final class ScrollLibrary {
             let file = project(entry).appendingPathComponent("original.png")
             guard try type(of: file) == .typeRegular else { throw LibraryError.originalGone }
             let image = try readPNG(file)
-            let indexed = try document(at: sidecar(entry), revision: entry.revision, width: image.width, height: image.height, id: id)
+            let indexed = try document(at: sidecar(entry), revision: entry.revision, id: id, dimensions: (image.width, image.height))
             guard let doc = try indexed ?? newestDocument(in: project(entry), width: image.width, height: image.height, id: id),
                   let revision = doc.revision else { throw LibraryError.recordMismatch }
             if entry.revision != revision || entry.name != doc.name || entry.date != doc.record.endedAt {

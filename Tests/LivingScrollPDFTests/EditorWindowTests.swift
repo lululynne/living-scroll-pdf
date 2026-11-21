@@ -59,6 +59,68 @@ final class EditorWindowTests: XCTestCase {
         XCTAssertEqual(try library.entries().map(\.id), [id])
     }
 
+    @MainActor func testPartialSuffixCanBeRemovedBeforeSavingAndExporting() async throws {
+        _ = NSApplication.shared
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let library = ScrollLibrary(outputFolder: base.appendingPathComponent("Exports"), root: base.appendingPathComponent("Library"))
+        let (image, complete) = try capture()
+        var record = complete
+        record.isPartial = true
+        let initial = AppDelegate.saveCapture(image, record: record, library: library)
+        XCTAssertNil(initial.error)
+        XCTAssertTrue(initial.document.name.hasSuffix(L("-未完成", "-partial")))
+        let editor = EditorWindow(document: initial.document, original: image, categoryID: nil, saved: true, library: library)
+        let window = try XCTUnwrap(editor.window)
+        defer { window.close() }
+        let views = descendants(try XCTUnwrap(window.contentView))
+        let field = try XCTUnwrap(views.compactMap { $0 as? NSTextField }.first { $0.placeholderString == EditorCopy.name })
+        field.stringValue = "Trip"
+        editor.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: field))
+        try await waitFor("autosave keeps the chosen partial name") { try library.entries().first?.name == "Trip" }
+        var exported: URL?
+        editor.showExportedFiles = { exported = $0 }
+        let button = try XCTUnwrap(views.compactMap { $0 as? NSButton }.first { $0.title == EditorCopy.export })
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(button.action), to: button.target, from: button))
+        try await waitFor("export finishes") { exported != nil && !editor.isBusy }
+        XCTAssertEqual(field.stringValue, "Trip")
+        XCTAssertEqual(exported?.lastPathComponent, "Trip.pdf")
+        XCTAssertTrue(try library.load(initial.document.id).document.record.isPartial)
+    }
+
+    @MainActor func testLibraryChangesReachAnOpenEditorAndSurviveItsNextAutosave() async throws {
+        _ = NSApplication.shared
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let output = base.appendingPathComponent("Exports"), root = base.appendingPathComponent("Library")
+        let library = ScrollLibrary(outputFolder: output, root: root)
+        let (image, record) = try capture()
+        let from = try library.addCategory("Inbox"), to = try library.addCategory("Filed")
+        let saved = try library.save(EditDocument(name: "Old name", record: record), original: image, categoryID: from.id)
+        let editor = EditorWindow(document: saved, original: image, categoryID: from.id, saved: true, library: library)
+        let window = try XCTUnwrap(editor.window)
+        defer { window.close() }
+        let views = descendants(try XCTUnwrap(window.contentView))
+        let name = try XCTUnwrap(views.compactMap { $0 as? NSTextField }.first { $0.placeholderString == EditorCopy.name })
+        let picker = try XCTUnwrap(views.compactMap { $0 as? NSPopUpButton }.first { $0.accessibilityLabel() == EditorCopy.category })
+        try library.rename(id: saved.id, to: "From the library")
+        try library.setCategory(ids: [saved.id], category: to.id)
+        try await waitFor("open editor shows the library name and category") {
+            name.stringValue == "From the library" && picker.selectedItem?.representedObject as? UUID == to.id
+        }
+        // A separate process can move the same row without notifying this window.
+        try ScrollLibrary(outputFolder: output, root: root).setCategory(ids: [saved.id], category: nil)
+        let canvas = try XCTUnwrap(views.compactMap { $0 as? EditCanvas }.first)
+        canvas.tool = .pen
+        canvas.beginInteraction(at: CGPoint(x: 5, y: 5))
+        canvas.endInteraction(at: CGPoint(x: 100, y: 50))
+        try await waitFor("edits save on the renamed project") { try library.load(saved.id).document.layers.count == 1 }
+        let reopened = try library.load(saved.id)
+        XCTAssertEqual(reopened.document.name, "From the library")
+        XCTAssertNil(reopened.categoryID)
+        XCTAssertEqual(try library.entries().map(\.id), [saved.id])
+    }
+
     @MainActor func testExportButtonPublishesCurrentLayersWhenLibraryCannotBeWritten() async throws {
         _ = NSApplication.shared
         let fm = FileManager.default, base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

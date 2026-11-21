@@ -19,6 +19,7 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     private var currentDocument: EditDocument
     var documentID: UUID { currentDocument.id }
     private var categoryID: UUID?
+    private var categoryEdited = false
     private let canvas: EditCanvas
     private let scroll = NSScrollView()
     private let name = NSTextField()
@@ -402,6 +403,18 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     }
 
     @objc private func refreshCategories(_ notification: Notification? = nil) {
+        if let change = notification?.userInfo?["metadataChange"] as? ScrollLibrary.MetadataChange {
+            switch change {
+            case let .renamed(id, previous, revision, newName) where id == documentID && previous == currentDocument.revision:
+                if name.stringValue == currentDocument.name { name.stringValue = newName }
+                currentDocument.name = newName
+                currentDocument.revision = revision
+                window?.title = newName + " — " + EditorCopy.editor
+            case let .moved(ids, category) where ids.contains(documentID) && !categoryEdited:
+                categoryID = category
+            default: break
+            }
+        }
         categoryRefresh?.cancel()
         let library = self.library
         categoryRefresh = Task {
@@ -434,6 +447,7 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     @objc private func chooseCategory() {
         if categories.selectedItem?.tag != 1 {
             categoryID = categories.selectedItem?.representedObject as? UUID
+            categoryEdited = true
             markEdited()
             return
         }
@@ -453,6 +467,7 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
             Task {
                 do {
                     self.categoryID = try await Task.detached(priority: .userInitiated) { try library.addCategory(name).id }.value
+                    self.categoryEdited = true
                     self.refreshCategories()
                     self.markEdited()
                     window.endSheet(progress)
@@ -512,12 +527,13 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
         try Task.checkCancellation()
         guard hasEdits || currentDocument.revision == nil else { return currentDocument }
         let draft = snapshot(), generation = changeNumber, displayedName = name.stringValue
-        let original = self.original, library = self.library, chosenCategory = categoryID
+        let original = self.original, library = self.library, chosenCategory = categoryID, keepCategory = !categoryEdited
         let save = Task { () throws -> EditDocument in
             defer { activeSave = nil }
             let stored = try await Task.detached(priority: .userInitiated) {
-                try library.save(draft, original: original, categoryID: chosenCategory)
+                try library.save(draft, original: original, categoryID: chosenCategory, preservingCategory: keepCategory)
             }.value
+            if categoryID == chosenCategory { categoryEdited = false }
             currentDocument = stored
             window?.title = stored.name + " — " + EditorCopy.editor
             if stored.id != draft.id && name.stringValue == displayedName { name.stringValue = stored.name }

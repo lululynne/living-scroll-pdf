@@ -72,6 +72,63 @@ final class ScrollLibraryTests: XCTestCase {
         XCTAssertEqual(try fresh.entries(matching: "会议草稿-2.png").map(\.id), [document.id])
     }
 
+    func testLibraryRenameChangesTheIndexedSidecarWithoutReadingTheOriginal() throws {
+        let base = try folder(), library = ScrollLibrary(testDirectory: base)
+        let category = try library.addCategory("Notes")
+        var partial = record()
+        partial.isPartial = true
+        let layer = EditLayer(kind: .text, rect: CGRect(x: 2, y: 4, width: 16, height: 8), text: "Keep me")
+        let saved = try library.save(EditDocument(name: "Draft-partial", record: partial, layers: [layer]),
+                                     original: image(0.2), categoryID: category.id)
+        try library.recordExport(base.appendingPathComponent("Shared earlier.pdf"), for: saved.id)
+        let original = try library.originalURL(for: saved.id)
+        let offline = base.appendingPathComponent("offline.png")
+        try FileManager.default.moveItem(at: original, to: offline)
+        for invalid in ["", " \t\n "] {
+            XCTAssertThrowsError(try library.rename(id: saved.id, to: invalid))
+        }
+        XCTAssertEqual(try library.entries().first?.name, saved.name)
+        try library.rename(id: saved.id, to: "  .Trip/Day:1.  ")
+        XCTAssertEqual(try library.entries(matching: "Shared earlier", category: .category(category.id)).first?.name, "Trip-Day-1")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: original.path))
+        try FileManager.default.moveItem(at: offline, to: original)
+        let reopened = try ScrollLibrary(testDirectory: base).load(saved.id)
+        XCTAssertEqual(reopened.document.name, "Trip-Day-1")
+        XCTAssertNotEqual(reopened.document.revision, saved.revision)
+        XCTAssertEqual(reopened.document.layers, [layer])
+        XCTAssertTrue(reopened.document.record.isPartial)
+        XCTAssertEqual(reopened.categoryID, category.id)
+    }
+
+    func testBatchCategoryMovesUseOneIndexChangeAndLeaveSidecarsInPlace() throws {
+        let base = try folder(), library = ScrollLibrary(testDirectory: base), source = try image(0.4)
+        let from = try library.addCategory("Inbox"), to = try library.addCategory("Filed")
+        let documents = try ["One", "Two", "Three"].map {
+            try library.save(EditDocument(name: $0, record: record()), original: source, categoryID: from.id)
+        }
+        let ids = [documents[0].id, documents[1].id]
+        let sidecars = try documents.map { doc in
+            try library.originalURL(for: doc.id).deletingLastPathComponent()
+                .appendingPathComponent(XCTUnwrap(doc.revision).uuidString + ".edit.json")
+        }
+        let before = try sidecars.map { try Data(contentsOf: $0) }
+        XCTAssertThrowsError(try library.setCategory(ids: ids + [UUID()], category: to.id))
+        XCTAssertThrowsError(try library.setCategory(ids: ids, category: UUID()))
+        XCTAssertThrowsError(try library.addCategory("Never created", assigning: ids + [UUID()]))
+        XCTAssertFalse(try library.categories().contains { $0.name == "Never created" })
+        XCTAssertEqual(try library.entries(category: .category(from.id)).count, 3)
+
+        try library.setCategory(ids: ids, category: to.id)
+        let reopened = ScrollLibrary(testDirectory: base)
+        XCTAssertEqual(Set(try reopened.entries(category: .category(to.id)).map(\.id)), Set(ids))
+        XCTAssertEqual(try reopened.entries(category: .category(from.id)).map(\.id), [documents[2].id])
+        let new = try reopened.addCategory("New folder", assigning: ids)
+        XCTAssertEqual(Set(try library.entries(category: .category(new.id)).map(\.id)), Set(ids))
+        try reopened.setCategory(ids: ids, category: nil)
+        XCTAssertEqual(Set(try library.entries(category: .uncategorized).map(\.id)), Set(ids))
+        XCTAssertEqual(try sidecars.map { try Data(contentsOf: $0) }, before)
+    }
+
     func testDeletingAndRenamingCategoriesPreservePicturesAndDateOrder() throws {
         let root = try folder()
         let library = ScrollLibrary(testDirectory: root)

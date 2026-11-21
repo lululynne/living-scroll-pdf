@@ -108,18 +108,24 @@ enum Exporter {
             supplied = L("卷轴PDF", "LivingScrollPDF") + "-\(record.appName)-\(stamp.string(from: record.endedAt))"
         }
         let unsafe = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/:\\"))
-        let cleaned = supplied.components(separatedBy: unsafe).joined(separator: "-")
-        // Leave room for the partial marker and extension even with multibyte filenames.
+        var cleaned = supplied.components(separatedBy: unsafe).joined(separator: "-")
+        var partialSuffix = ""
+        if record.isPartial {
+            // Older names can have 220 bytes followed by a marker in either language.
+            if let marker = ["-未完成", "-partial"].first(where: { cleaned.suffix($0.count).lowercased() == $0 }) {
+                partialSuffix = String(cleaned.suffix(marker.count))
+                cleaned.removeLast(marker.count)
+            } else if name == nil {
+                partialSuffix = L("-未完成", "-partial")
+            }
+        }
         var stem = ""
         for character in cleaned {
             if stem.utf8.count + String(character).utf8.count > 220 { break }
             stem.append(character)
         }
-        if stem.isEmpty { stem = L("长截图", "Screenshot") }
-        if record.isPartial && !stem.hasSuffix("-未完成") && !stem.lowercased().hasSuffix("-partial") {
-            stem += L("-未完成", "-partial")
-        }
-        return stem
+        if stem.isEmpty && !cleaned.isEmpty { stem = L("长截图", "Screenshot") }
+        return stem + partialSuffix
     }
 
     /// Encode all of the new products before replacing any public file.
@@ -213,6 +219,9 @@ private enum ExportPublication {
     private static let extensions = ["png", "pdf", "json"]
     private static let owner = ".living-scroll-publication-v1"
     private static let exchange = ".exchange.json"
+    private static let retiredPrefix = ".living-scroll-export-done-"
+    private static let stagingFiles = Set(extensions.flatMap { ["output." + $0, "prepared." + $0] }
+        + [owner, exchange, ".copying", ".exchange.pending"])
 
     private struct FileVersion: Codable, Equatable {
         let device: dev_t, inode: ino_t, size: off_t
@@ -280,9 +289,8 @@ private enum ExportPublication {
     }
 
     static func recoverPending(in folder: URL) throws {
-        let stage = stagingDirectory(in: folder)
-        guard try attributes(of: stage) != nil else { return }
-        try withOutputLock(in: folder) { try recover(stage: stage, in: folder) }
+        guard try attributes(of: folder) != nil else { return }
+        try withOutputLock(in: folder) { try recover(stage: stagingDirectory(in: folder), in: folder) }
     }
 
     private static func withOutputLock<T>(in folder: URL, _ action: () throws -> T) throws -> T {
@@ -307,7 +315,7 @@ private enum ExportPublication {
         var prepared = false
         defer {
             // After marking the staged set ready, retain any unpublished products for retry.
-            if !prepared { try? fm.removeItem(at: stage) }
+            if !prepared { try? discard(stage: stage, in: folder) }
         }
         try Data().write(to: stage.appendingPathComponent(owner))
         let png = stage.appendingPathComponent("output.png")
@@ -328,23 +336,54 @@ private enum ExportPublication {
         } catch let error as POSIXError where error.code == .EEXIST {
             publishedStem = try resumePublication(stem: target.stem, stage: stage, folder: folder)
         }
-        try fm.removeItem(at: stage)
+        try discard(stage: stage, in: folder)
         return folder.appendingPathComponent(publishedStem + ".pdf")
     }
 
+    private static func validStagingNames(_ names: [String]) -> Bool {
+        names.filter { $0.hasSuffix(".ready") }.count <= 1
+            && names.allSatisfy { stagingFiles.contains($0) || $0.hasSuffix(".ready") }
+    }
+
+    private static func discard(stage: URL, in folder: URL) throws {
+        // Free the active name before unlinking anything, including its ownership marker.
+        let retired = folder.appendingPathComponent(retiredPrefix + UUID().uuidString)
+        guard renamex_np(stage.path, retired.path, UInt32(RENAME_EXCL)) == 0 else { throw posixError() }
+        removeRetiredStage(retired)
+    }
+
+    private static func removeRetiredStage(_ directory: URL) {
+        let fd = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard fd >= 0 else { return }
+        defer { Darwin.close(fd) }
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path),
+              validStagingNames(names) else { return }
+        // Remove only the expected regular files. A newly added file keeps the directory alive.
+        for name in names {
+            var state = stat()
+            if fstatat(fd, name, &state, AT_SYMLINK_NOFOLLOW) == 0 && state.st_mode & S_IFMT == S_IFREG {
+                _ = unlinkat(fd, name, 0)
+            }
+        }
+        _ = rmdir(directory.path)
+    }
+
     private static func recover(stage: URL, in folder: URL) throws {
+        let fm = FileManager.default
+        for name in try fm.contentsOfDirectory(atPath: folder.path) where name.hasPrefix(retiredPrefix) {
+            if UUID(uuidString: String(name.dropFirst(retiredPrefix.count))) != nil {
+                removeRetiredStage(folder.appendingPathComponent(name))
+            }
+        }
         guard let state = try attributes(of: stage) else { return }
         guard state.st_mode & S_IFMT == S_IFDIR else { throw Exporter.ExportError.cannotCreate(stage) }
-        let fm = FileManager.default
         let names = try fm.contentsOfDirectory(atPath: stage.path)
         if !names.isEmpty {
-            let pending = names.filter { $0.hasSuffix(".ready") }
-            let known = Set(extensions.flatMap { ["output." + $0, "prepared." + $0] } + [owner, exchange, ".copying", ".exchange.pending"] + pending)
             // A reserved name occupied by unrelated files must survive an export attempt.
-            guard names.contains(owner), pending.count <= 1, Set(names).isSubset(of: known) else {
+            guard names.contains(owner), validStagingNames(names) else {
                 throw Exporter.ExportError.cannotCreate(stage)
             }
-            if let marker = pending.first {
+            if let marker = names.first(where: { $0.hasSuffix(".ready") }) {
                 let stem = String(marker.dropLast(".ready".count))
                 guard !stem.isEmpty, stem != ".", stem != ".." else {
                     throw Exporter.ExportError.cannotCreate(stage)
@@ -356,7 +395,7 @@ private enum ExportPublication {
             }
         }
         // An interrupted encoder has no ready marker and has never touched public files.
-        try fm.removeItem(at: stage)
+        try discard(stage: stage, in: folder)
     }
 
     private static func resumePublication(stem: String, stage: URL, folder: URL) throws -> String {

@@ -1,6 +1,32 @@
 import AppKit
 import UniformTypeIdentifiers
 
+private final class LibraryTableView: NSTableView {
+    var selectionMenu: (() -> NSMenu?)?
+    var editName: ((Int) -> Void)?
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let clicked = row(at: convert(event.locationInWindow, from: nil))
+        guard clicked >= 0 else { return nil }
+        window?.makeFirstResponder(self)
+        if !selectedRowIndexes.contains(clicked) {
+            selectRowIndexes(IndexSet(integer: clicked), byExtendingSelection: false)
+        }
+        return selectionMenu?()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let clicked = row(at: point)
+        if event.clickCount == 2, clicked >= 0, column(at: point) == column(withIdentifier: NSUserInterfaceItemIdentifier("file")) {
+            selectRowIndexes(IndexSet(integer: clicked), byExtendingSelection: false)
+            editName?(clicked)
+        } else {
+            super.mouseDown(with: event)
+        }
+    }
+}
+
 @MainActor
 final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     private let library: ScrollLibrary
@@ -9,7 +35,7 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
     private let categoryPicker = NSPopUpButton()
     private let manage = NSButton()
     private let search = NSSearchField()
-    private let table = NSTableView()
+    private let table = LibraryTableView()
     private let empty = NSTextField(wrappingLabelWithString: "")
     private let importButton = NSButton()
     private let openButton = NSButton()
@@ -22,6 +48,7 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
     private let dates = DateFormatter()
     private var displayedChinese: Bool?
     private var reload: Task<Void, Never>?
+    private var renaming: (id: UUID, field: NSTextField)?
 
     init(library: ScrollLibrary = .shared, onDelete: @escaping (UUID) -> Void, onOpen: @escaping (UUID) -> Void) {
         self.library = library
@@ -87,10 +114,16 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
         table.rowHeight = 30
         table.usesAlternatingRowBackgroundColors = true
         table.allowsColumnReordering = false
+        table.allowsMultipleSelection = true
         table.delegate = self
         table.dataSource = self
         table.target = self
         table.doubleAction = #selector(openRow(_:))
+        table.selectionMenu = { [weak self] in self?.rowMenu() }
+        table.editName = { [weak self] row in
+            guard let self, self.rows.indices.contains(row) else { return }
+            self.beginRenaming(self.rows[row].id)
+        }
         let scroll = NSScrollView()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
@@ -174,6 +207,9 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
     }
 
     private func refresh() {
+        // Reloading a view-based table would detach its active field editor.
+        // Finishing the rename always requests the latest rows and categories.
+        guard renaming == nil else { return }
         reload?.cancel()
         let library = self.library, query = search.stringValue, requested = filter
         reload = Task {
@@ -211,19 +247,15 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
     }
 
     private func showRows(_ entries: [ScrollEntry]) {
-        let selected = selectedID
+        let selected = Set(selectedIDs)
         rows = entries
         table.reloadData()
-        table.deselectAll(nil)
-        if let selected, let index = rows.firstIndex(where: { $0.id == selected }) {
-            table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-        }
+        table.selectRowIndexes(IndexSet(rows.indices.filter { selected.contains(rows[$0].id) }), byExtendingSelection: false)
         empty.stringValue = search.stringValue.isEmpty && filter == .all
             ? L("保存一次长截图，或打开已有的 PNG。", "Save a capture or open an existing PNG.")
             : L("没有匹配的长截图。", "No matching screenshots.")
         empty.isHidden = !rows.isEmpty
-        openButton.isEnabled = selectedID != nil
-        deleteButton.isEnabled = selectedID != nil
+        updateSelectionButtons()
     }
 
     @objc private func selectCategory() {
@@ -233,11 +265,16 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
     }
 
     func controlTextDidChange(_ obj: Notification) {
+        if let field = obj.object as? NSTextField, field !== search { return }
         refresh()
     }
 
+    private var selectedIDs: [UUID] {
+        table.selectedRowIndexes.compactMap { rows.indices.contains($0) ? rows[$0].id : nil }
+    }
+
     private var selectedID: UUID? {
-        rows.indices.contains(table.selectedRow) ? rows[table.selectedRow].id : nil
+        table.numberOfSelectedRows == 1 && rows.indices.contains(table.selectedRow) ? rows[table.selectedRow].id : nil
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
@@ -252,6 +289,7 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
             cell = NSTableCellView()
             cell.identifier = key
             let label = NSTextField(labelWithString: "")
+            if key.rawValue == "file" { label.delegate = self }
             label.lineBreakMode = key.rawValue == "file" ? .byTruncatingMiddle : .byTruncatingTail
             label.textColor = key.rawValue == "file" ? .labelColor : .secondaryLabelColor
             cell.addSubview(label)
@@ -265,8 +303,7 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
         }
         switch key.rawValue {
         case "file":
-            let query = search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            cell.textField?.stringValue = entry.matchingFilename(query) ?? entry.name
+            cell.textField?.stringValue = displayedName(for: entry)
         case "category":
             cell.textField?.stringValue = categories.first { $0.id == entry.categoryID }?.name ?? EditorCopy.uncategorized
         default: cell.textField?.stringValue = dates.string(from: entry.date)
@@ -276,8 +313,126 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
-        openButton.isEnabled = selectedID != nil
-        deleteButton.isEnabled = selectedID != nil
+        updateSelectionButtons()
+    }
+
+    private func updateSelectionButtons() {
+        let enabled = renaming == nil && selectedID != nil
+        openButton.isEnabled = enabled
+        deleteButton.isEnabled = enabled
+    }
+
+    private func displayedName(for entry: ScrollEntry) -> String {
+        let query = search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return entry.matchingFilename(query) ?? entry.name
+    }
+
+    private struct CategoryMove {
+        let ids: [UUID]
+        let category: UUID?
+    }
+
+    private func rowMenu() -> NSMenu? {
+        let ids = selectedIDs
+        guard !ids.isEmpty else { return nil }
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let rename = menu.addItem(withTitle: L("重命名…", "Rename…"), action: #selector(renameRow(_:)), keyEquivalent: "")
+        rename.target = self
+        rename.representedObject = ids.first
+        rename.isEnabled = ids.count == 1
+        let move = menu.addItem(withTitle: L("移到分类", "Move to Category"), action: nil, keyEquivalent: "")
+        let destinations = NSMenu()
+        destinations.autoenablesItems = false
+        func addDestination(_ title: String, _ id: UUID?) {
+            let item = destinations.addItem(withTitle: title, action: #selector(moveRows(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = CategoryMove(ids: ids, category: id)
+        }
+        addDestination(EditorCopy.uncategorized, nil)
+        if !categories.isEmpty { destinations.addItem(.separator()) }
+        for category in categories { addDestination(category.name, category.id) }
+        destinations.addItem(.separator())
+        let create = destinations.addItem(withTitle: EditorCopy.newCategory, action: #selector(createCategoryForRows(_:)), keyEquivalent: "")
+        create.target = self
+        create.representedObject = ids
+        move.submenu = destinations
+        return menu
+    }
+
+    @objc private func moveRows(_ sender: NSMenuItem) {
+        guard let move = sender.representedObject as? CategoryMove else { return }
+        updateLibrary { library in
+            try library.setCategory(ids: move.ids, category: move.category)
+            return nil
+        }
+    }
+
+    @objc private func createCategoryForRows(_ sender: NSMenuItem) {
+        if let ids = sender.representedObject as? [UUID] { editCategory(nil, assigning: ids) }
+    }
+
+    @objc private func renameRow(_ sender: NSMenuItem) {
+        if let id = sender.representedObject as? UUID { beginRenaming(id) }
+    }
+
+    private func beginRenaming(_ id: UUID) {
+        guard let window, let row = rows.firstIndex(where: { $0.id == id }) else { return }
+        if renaming != nil { finishRenaming(with: nil) }
+        table.scrollRowToVisible(row)
+        let column = table.column(withIdentifier: NSUserInterfaceItemIdentifier("file"))
+        guard let field = (table.view(atColumn: column, row: row, makeIfNecessary: true) as? NSTableCellView)?.textField else { return }
+        reload?.cancel()
+        renaming = (id, field)
+        openButton.keyEquivalent = ""
+        updateSelectionButtons()
+        // A search result can be displaying an older exported filename.
+        field.stringValue = rows[row].name
+        field.isEditable = true
+        field.isBezeled = true
+        field.drawsBackground = true
+        if window.makeFirstResponder(field) { field.currentEditor()?.selectAll(nil) }
+        else { finishRenaming(with: nil) }
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy command: Selector) -> Bool {
+        guard control === renaming?.field, !textView.hasMarkedText() else { return false }
+        switch command {
+        case #selector(NSResponder.cancelOperation(_:)): finishRenaming(with: nil)
+        case #selector(NSResponder.insertNewline(_:)): finishRenaming(with: textView.string)
+        default: return false
+        }
+        window?.makeFirstResponder(table)
+        return true
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField, field === renaming?.field else { return }
+        finishRenaming(with: field.stringValue)
+    }
+
+    func tableView(_ tableView: NSTableView, didRemove rowView: NSTableRowView, forRow row: Int) {
+        if renaming?.field.isDescendant(of: rowView) == true { finishRenaming(with: nil) }
+    }
+
+    private func finishRenaming(with name: String?) {
+        guard let (id, field) = renaming else { return }
+        renaming = nil
+        _ = field.abortEditing()
+        field.isEditable = false
+        field.isSelectable = false
+        field.isBezeled = false
+        field.drawsBackground = false
+        let entry = rows.first { $0.id == id }
+        if let entry { field.stringValue = displayedName(for: entry) }
+        openButton.keyEquivalent = "\r"
+        updateSelectionButtons()
+        if let name, name != entry?.name {
+            updateLibrary { library in
+                try library.rename(id: id, to: name)
+                return nil
+            }
+        } else { refresh() }
     }
 
     @objc private func confirmDeletion() {
@@ -328,7 +483,7 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
     @objc private func addCategory() { editCategory(nil) }
     @objc private func renameCategory() { if let selectedCategory { editCategory(selectedCategory) } }
 
-    private func editCategory(_ category: ScrollCategory?) {
+    private func editCategory(_ category: ScrollCategory?, assigning ids: [UUID] = []) {
         guard let window else { return }
         let alert = NSAlert()
         alert.messageText = category == nil ? L("新建分类", "New Category") : L("重命名分类", "Rename Category")
@@ -342,12 +497,13 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
         alert.beginSheetModal(for: window) { [weak self] response in
             guard let self, response == .alertFirstButtonReturn else { return }
             let name = field.stringValue
-            self.updateCategories { library in
+            self.updateLibrary { library in
                 if let category {
                     try library.renameCategory(category.id, to: name)
                     return nil
                 }
-                return .category(try library.addCategory(name).id)
+                let created = try library.addCategory(name, assigning: ids)
+                return ids.isEmpty ? .category(created.id) : nil
             }
         }
     }
@@ -362,7 +518,7 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
         remove.hasDestructiveAction = true
         alert.beginSheetModal(for: window) { [weak self] response in
             guard let self, response == .alertSecondButtonReturn else { return }
-            self.updateCategories { library in
+            self.updateLibrary { library in
                 try library.deleteCategory(category.id)
                 return .uncategorized
             }
@@ -370,15 +526,15 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
     }
 
     /// A large capture can hold the library's write lock while its first PNG is encoded.
-    private func updateCategories(_ change: @escaping (ScrollLibrary) throws -> ScrollCategoryFilter?) {
+    private func updateLibrary(_ change: @escaping (ScrollLibrary) throws -> ScrollCategoryFilter?) {
         let store = library
         Task {
             do {
                 if let next = try await Task.detached(priority: .userInitiated, operation: { try change(store) }).value {
                     filter = next
                 }
-                refresh()
             } catch { showError(error) }
+            refresh()
         }
     }
 

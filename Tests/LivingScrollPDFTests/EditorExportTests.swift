@@ -1,4 +1,5 @@
 import CoreGraphics
+import Darwin
 import Foundation
 import ImageIO
 import XCTest
@@ -111,7 +112,7 @@ final class EditorExportTests: XCTestCase {
         let base = pdf.deletingPathExtension()
         let png = base.appendingPathExtension("png")
         XCTAssertEqual(pdf.deletingLastPathComponent().path, folder.path)
-        XCTAssertTrue(base.lastPathComponent.contains(L("-未完成", "-partial")))
+        XCTAssertEqual(base.lastPathComponent, "标注 - proof")
         let source = try XCTUnwrap(CGImageSourceCreateWithURL(png as CFURL, nil))
         let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
         let pixels = try XCTUnwrap(PixelFrame(cgImage: image))
@@ -133,6 +134,8 @@ final class EditorExportTests: XCTestCase {
         XCTAssertEqual(saved.editingProjectID, doc.id)
         XCTAssertEqual(saved.editLayerCount, 2)
         XCTAssertEqual(saved.windowTitle, "")
+        XCTAssertTrue(saved.isPartial)
+        XCTAssertEqual(saved.partialReason, record.partialReason)
         XCTAssertEqual(saved.gaps, record.gaps)
         XCTAssertEqual(saved.pngSHA256, try Exporter.sha256(of: png))
         XCTAssertEqual(saved.pdfSHA256, try Exporter.sha256(of: pdf))
@@ -167,6 +170,21 @@ final class EditorExportTests: XCTestCase {
         CaptureRecord(appName: "编辑(器) 🖌", windowTitle: "private contact 431929",
                       startedAt: Date(timeIntervalSince1970: 100), endedAt: Date(timeIntervalSince1970: 120),
                       framesStitched: 2, droppedFrames: 0, pixelWidth: 64, pixelHeight: 64, pointScale: 2)
+    }
+
+    func testPartialFilenameRemainsStableAtTheByteLimit() {
+        var record = fixtureRecord()
+        record.isPartial = true
+        record.appName = String(repeating: "截图", count: 100)
+        let initial = Exporter.fileStem(for: record)
+        XCTAssertTrue(initial.hasSuffix(L("-未完成", "-partial")))
+        XCTAssertEqual(Exporter.fileStem(for: record, name: initial), initial)
+
+        let base = String(repeating: "x", count: 220)
+        for suffix in ["-未完成", "-PARTIAL"] {
+            XCTAssertEqual(Exporter.fileStem(for: record, name: base + suffix), base + suffix)
+        }
+        XCTAssertEqual(Exporter.fileStem(for: record, name: base), base)
     }
 
     private func readRecord(_ url: URL) throws -> CaptureRecord {
@@ -349,8 +367,48 @@ final class EditorExportTests: XCTestCase {
             try fm.copyItem(at: base.appendingPathExtension(ext), to: stage.appendingPathComponent("output." + ext))
         }
         let png = folder.appendingPathComponent(base.lastPathComponent + ".png")
-        try Data(contentsOf: base.appendingPathExtension("png")).write(to: png, options: .atomic)
+        let stagedPNG = stage.appendingPathComponent("output.png")
+        try fm.copyItem(at: base.appendingPathExtension("png"), to: stagedPNG)
+        guard Darwin.rename(stagedPNG.path, png.path) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         return stage
+    }
+
+    func testInterruptedStageDeletionIsFinishedOnStartupAndBeforeTheNextExport() throws {
+        let fm = FileManager.default
+        let folder = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: folder) }
+        let image = try stripedOriginal()
+        let published = try EditorExport.write(EditDocument(name: "Original", record: fixtureRecord()), original: image, folder: folder)
+        let originalPDF = try Data(contentsOf: published)
+        let prefix = ".living-scroll-export-done-"
+        let contents = Data("keep".utf8)
+        func directory(_ name: String, containing filename: String) throws -> URL {
+            let directory = folder.appendingPathComponent(name)
+            try fm.createDirectory(at: directory, withIntermediateDirectories: false)
+            try contents.write(to: directory.appendingPathComponent(filename))
+            return directory
+        }
+
+        let similar = try directory(prefix + "notes", containing: "prepared.pdf")
+        let unrelated = try directory(prefix + UUID().uuidString, containing: "personal.pdf")
+        let file = folder.appendingPathComponent(prefix + UUID().uuidString)
+        try contents.write(to: file)
+        let link = folder.appendingPathComponent(prefix + UUID().uuidString)
+        try fm.createSymbolicLink(at: link, withDestinationURL: similar)
+
+        // A crash after the rename and the first few unlinks can leave just one prepared file.
+        let first = try directory(prefix + UUID().uuidString, containing: "prepared.pdf")
+        try Exporter.recoverPendingExport(in: folder)
+        XCTAssertFalse(fm.fileExists(atPath: first.path))
+        let second = try directory(prefix + UUID().uuidString, containing: "prepared.png")
+        let next = try EditorExport.write(EditDocument(name: "Next", record: fixtureRecord()), original: image, folder: folder)
+        XCTAssertEqual(next.lastPathComponent, "Next.pdf")
+        XCTAssertFalse(fm.fileExists(atPath: second.path))
+        XCTAssertEqual(try Data(contentsOf: published), originalPDF)
+        XCTAssertEqual(try Data(contentsOf: similar.appendingPathComponent("prepared.pdf")), contents)
+        XCTAssertEqual(try Data(contentsOf: unrelated.appendingPathComponent("personal.pdf")), contents)
+        XCTAssertEqual(try Data(contentsOf: file), contents)
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: link.path), similar.path)
     }
 
     func testStartupRecoveryFinishesAnInterruptedReplacement() throws {
