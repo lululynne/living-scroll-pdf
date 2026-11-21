@@ -11,7 +11,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyRef: EventHotKeyRef?
     private var editors: [EditorWindow] = []
     private var opening: Set<UUID> = []
-    private lazy var library = LibraryWindow { [weak self] id in self?.openSavedCapture(id) }
+    private var quitAfterCapture = false
+    private lazy var library = LibraryWindow(onDelete: { [weak self] id in
+        self?.opening.remove(id)
+        self?.editors.first { $0.documentID == id }?.close()
+    }, onOpen: { [weak self] id in self?.openSavedCapture(id) })
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
@@ -24,6 +28,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let owner = ProcessInfo.processInfo.environment["JZ_TEST_OWNER"] {
             runEndToEndTest(owner: owner)
             return
+        }
+
+        Task {
+            let failures = await Task.detached {
+                let library = ScrollLibrary.shared
+                var failures: [String] = []
+                for folder in Exporter.outputFolders {
+                    do { try Exporter.recoverPendingExport(in: folder) }
+                    catch { failures.append(EditorCopy.unfinishedExport + " " + error.localizedDescription) }
+                }
+                do { try library.prepare() }
+                catch { failures.append(EditorCopy.libraryUnavailable + " " + error.localizedDescription) }
+                return failures
+            }.value
+            if !failures.isEmpty {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = EditorCopy.failed
+                alert.informativeText = failures.joined(separator: "\n")
+                alert.runModal()
+            }
         }
 
         if !CGPreflightScreenCaptureAccess() {
@@ -137,9 +162,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showLibrary() { library.present() }
 
-    func editCapture(_ image: CGImage, record: CaptureRecord) {
+    /// Runs on the capture handoff queue before the editor can be closed.
+    nonisolated static func saveCapture(_ image: CGImage, record: CaptureRecord, library: ScrollLibrary = .shared)
+        -> (document: EditDocument, error: Error?) {
         let document = EditDocument(name: Exporter.fileStem(for: record), record: record)
-        present(document, original: image, categoryID: nil, saved: false)
+        do { return (try library.save(document, original: image, categoryID: nil), nil) }
+        catch { return (document, error) }
     }
 
     private func openSavedCapture(_ id: UUID) {
@@ -149,7 +177,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             defer { opening.remove(id) }
             do {
                 let item = try await Task.detached(priority: .userInitiated) { try ScrollLibrary.shared.load(id) }.value
-                present(item.document, original: item.original, categoryID: item.categoryID, saved: true)
+                guard opening.contains(id) else { return }
+                present(item.document, original: item.original, categoryID: item.categoryID)
             } catch {
                 let alert = NSAlert(error: error)
                 if let window = library.window { alert.beginSheetModal(for: window, completionHandler: nil) }
@@ -158,16 +187,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func present(_ document: EditDocument, original: CGImage, categoryID: UUID?, saved: Bool) {
+    func present(_ document: EditDocument, original: CGImage, categoryID: UUID? = nil, saveError: Error? = nil) {
         let id = document.id
         if let open = editors.first(where: { $0.documentID == id }) { open.present(); return }
-        let editor = EditorWindow(document: document, original: original, categoryID: categoryID, saved: saved)
+        let editor = EditorWindow(document: document, original: original, categoryID: categoryID, saved: saveError == nil)
         editors.append(editor)
         editor.onClose = { [weak self, weak editor] in self?.editors.removeAll { $0 === editor } }
         editor.present()
+        if let saveError { editor.showSaveProblem(saveError) }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if session?.isFinishing == true {
+            quitAfterCapture = true
+            return .terminateLater
+        }
         guard editors.contains(where: { $0.needsAttentionBeforeQuit() }) else { return .terminateNow }
         // Let AppKit enter the pending-termination state before replying to it.
         DispatchQueue.main.async { self.reviewBeforeQuit() }
@@ -206,7 +240,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.picker = nil
             guard let result else { return }
             let s = CaptureSession(pick: result) { [weak self] ended in
-                if self?.session === ended { self?.session = nil }
+                guard let self, session === ended else { return }
+                session = nil
+                if quitAfterCapture {
+                    quitAfterCapture = false
+                    reviewBeforeQuit()
+                }
             }
             self.session = s
             Task { @MainActor in await s.start() }
@@ -228,7 +267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func openMail() { NSWorkspace.shared.open(Links.mail) }
 
     @objc private func openFolder() {
-        let url = Exporter.outputFolder
+        let url = ScrollLibrary.shared.outputFolder
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         NSWorkspace.shared.open(url)
     }

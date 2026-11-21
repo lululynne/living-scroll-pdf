@@ -38,6 +38,16 @@ enum EditorCopy {
     static var saving: String { L("正在保存…", "Saving…") }
     static var exporting: String { L("正在导出…", "Exporting…") }
     static var saved: String { L("已保存到我的长截图", "Saved to My Screenshots") }
+    static var savedCopy: String { L("另一份编辑也已保留，当前版本已另存为副本", "Another edit was saved. This version is saved as a copy.") }
+    static var librarySaveFailed: String { L("图库保存失败，仍可导出。", "Couldn’t save to the library. You can still export.") }
+    static var libraryUnavailable: String { L("检查「我的长截图」时遇到问题。", "My Screenshots needs attention.") }
+    static var unfinishedExport: String { L("未能恢复上次导出。", "Couldn’t finish the previous export.") }
+    static var exportedWithoutLibrary: String { L("文件已导出，图库未更新", "Files exported. The library could not be updated.") }
+    static var redactionExported: String { L("已导出打码后的 PNG 和 PDF", "Redacted PNG and PDF exported") }
+    static var privateOriginalNotice: String { L("未打码的原图保存在本机的「我的长截图」。选中截图，点「删除截图」即可删除原图和编辑记录。", "The unredacted original is in My Screenshots on this Mac. Select the capture and choose Delete Screenshot to remove its original and edits.") }
+    static var deleteCapture: String { L("删除截图", "Delete Screenshot") }
+    static func confirmDeleteCapture(_ name: String) -> String { L("删除「\(name)」？", "Delete “\(name)”?") }
+    static var deleteCaptureDetails: String { L("将永久删除图库里的原图和全部编辑记录。已导出的文件会保留。", "This permanently deletes the library original and all its edits. Exported files are kept.") }
     static var savedExportFailed: String { L("编辑已保存，导出失败", "Edits saved. Export failed.") }
     static var failed: String { L("操作未完成", "Couldn’t complete the operation") }
     static var adjustColor: String { L("颜色", "Color") }

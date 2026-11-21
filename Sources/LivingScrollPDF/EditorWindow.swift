@@ -23,6 +23,7 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     private let scroll = NSScrollView()
     private let name = NSTextField()
     private let categories = NSPopUpButton()
+    private var categoryRefresh: Task<Void, Never>?
     private let color = NSColorWell()
     private let sizeLabel = NSTextField(labelWithString: "")
     private let sizes = NSPopUpButton()
@@ -38,8 +39,15 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     private var selectedFontSize: CGFloat = 32
     private(set) var isBusy = false
     private var hasEdits: Bool
+    private var changeNumber = 0
+    private var autosave: Task<Void, Never>?
+    private var activeSave: Task<EditDocument, Error>?
     private var localizeChrome: (() -> Void)?
     var onClose: (() -> Void)?
+    var showExportedFiles: (URL) -> Void = { pdf in
+        NSWorkspace.shared.activateFileViewerSelecting([pdf])
+        NSWorkspace.shared.open(pdf)
+    }
 
     init(document: EditDocument, original: CGImage, categoryID: UUID?, saved: Bool, library: ScrollLibrary = .shared) {
         self.library = library
@@ -47,7 +55,7 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
         self.original = original
         self.categoryID = categoryID
         hasEdits = !saved
-        canvas = EditCanvas(original: original, layers: document.layers)
+        canvas = EditCanvas(original: original, layers: document.layers, pointScale: document.record.pointScale)
         let host = EditorHostWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 670),
                                     styleMask: [.titled, .closable, .resizable, .miniaturizable],
                                     backing: .buffered, defer: false)
@@ -63,7 +71,7 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
         canvas.onChange = { [weak self] in self?.markEdited() }
         canvas.onSelectionChange = { [weak self] in self?.syncTools() }
         NotificationCenter.default.addObserver(self, selector: #selector(refreshCategories(_:)),
-                                                name: .scrollLibraryDidChange, object: nil)
+                                                name: .scrollLibraryDidChange, object: library)
         NotificationCenter.default.addObserver(self, selector: #selector(magnifying(_:)),
                                                 name: NSScrollView.willStartLiveMagnifyNotification, object: scroll)
         scroll.contentView.postsBoundsChangedNotifications = true
@@ -394,23 +402,33 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     }
 
     @objc private func refreshCategories(_ notification: Notification? = nil) {
-        do {
-            let available = try library.categories()
-            if let id = categoryID, !available.contains(where: { $0.id == id }) { categoryID = nil }
-            categories.removeAllItems()
-            categories.addItem(withTitle: EditorCopy.uncategorized)
-            for item in available {
-                categories.menu?.addItem(NSMenuItem(title: item.name, action: nil, keyEquivalent: ""))
-                categories.lastItem?.representedObject = item.id
+        categoryRefresh?.cancel()
+        let library = self.library
+        categoryRefresh = Task {
+            do {
+                let available = try await Task.detached { try library.categories() }.value
+                guard !Task.isCancelled else { return }
+                updateCategories(available)
+            } catch {
+                guard !Task.isCancelled else { return }
+                detail.stringValue = error.localizedDescription
+                detail.toolTip = detail.stringValue
             }
-            categories.selectItem(at: categoryID.flatMap { id in available.firstIndex { $0.id == id } }.map { $0 + 1 } ?? 0)
-            categories.menu?.addItem(.separator())
-            categories.addItem(withTitle: EditorCopy.newCategory)
-            categories.lastItem?.tag = 1
-        } catch {
-            detail.stringValue = error.localizedDescription
-            detail.toolTip = detail.stringValue
         }
+    }
+
+    private func updateCategories(_ available: [ScrollCategory]) {
+        if let id = categoryID, !available.contains(where: { $0.id == id }) { categoryID = nil }
+        categories.removeAllItems()
+        categories.addItem(withTitle: EditorCopy.uncategorized)
+        for item in available {
+            categories.menu?.addItem(NSMenuItem(title: item.name, action: nil, keyEquivalent: ""))
+            categories.lastItem?.representedObject = item.id
+        }
+        categories.selectItem(at: categoryID.flatMap { id in available.firstIndex { $0.id == id } }.map { $0 + 1 } ?? 0)
+        categories.menu?.addItem(.separator())
+        categories.addItem(withTitle: EditorCopy.newCategory)
+        categories.lastItem?.tag = 1
     }
 
     @objc private func chooseCategory() {
@@ -457,9 +475,62 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     }
 
     private func markEdited() {
+        changeNumber += 1
         hasEdits = true
         window?.isDocumentEdited = true
         showDimensions()
+        scheduleAutosave()
+    }
+
+    private func scheduleAutosave() {
+        autosave?.cancel()
+        autosave = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(450)) } catch { return }
+            guard let self else { return }
+            do { _ = try await saveCurrentEdits() }
+            catch is CancellationError { return }
+            catch { showSaveProblem(error) }
+        }
+    }
+
+    func showSaveProblem(_ error: Error) {
+        detail.stringValue = EditorCopy.librarySaveFailed + " " + error.localizedDescription
+        detail.toolTip = detail.stringValue
+    }
+
+    private func snapshot() -> EditDocument {
+        var draft = currentDocument
+        draft.name = Exporter.fileStem(for: draft.record, name: name.stringValue)
+        draft.layers = canvas.layersForSaving
+        return draft
+    }
+
+    /// Coalesce automatic and explicit saves. Each new write uses the revision returned
+    /// by its predecessor, even if more edits arrived while that write was running.
+    private func saveCurrentEdits() async throws -> EditDocument {
+        while let activeSave { _ = try await activeSave.value }
+        try Task.checkCancellation()
+        guard hasEdits || currentDocument.revision == nil else { return currentDocument }
+        let draft = snapshot(), generation = changeNumber, displayedName = name.stringValue
+        let original = self.original, library = self.library, chosenCategory = categoryID
+        let save = Task { () throws -> EditDocument in
+            defer { activeSave = nil }
+            let stored = try await Task.detached(priority: .userInitiated) {
+                try library.save(draft, original: original, categoryID: chosenCategory)
+            }.value
+            currentDocument = stored
+            window?.title = stored.name + " — " + EditorCopy.editor
+            if stored.id != draft.id && name.stringValue == displayedName { name.stringValue = stored.name }
+            if changeNumber == generation {
+                hasEdits = false
+                window?.isDocumentEdited = false
+                detail.stringValue = stored.id == draft.id ? EditorCopy.saved : EditorCopy.savedCopy
+                detail.toolTip = detail.stringValue
+            }
+            return stored
+        }
+        activeSave = save
+        return try await save.value
     }
 
     @objc private func saveEdits() { persist(export: false) }
@@ -485,53 +556,58 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
         guard !isBusy, let window else { completion?(false); return }
         canvas.finishTextEditing()
         window.makeFirstResponder(canvas)
-        currentDocument.name = Exporter.fileStem(for: currentDocument.record, name: name.stringValue)
-        name.stringValue = currentDocument.name
-        currentDocument.layers = canvas.layers
-        let snapshot = currentDocument, original = self.original, chosenCategory = categoryID, library = self.library
+        autosave?.cancel()
+        if export { canvas.releaseRenderCaches() }
         let progress = showProgress(export ? EditorCopy.exporting : EditorCopy.saving, in: window)
         Task {
-            var saved = false
-            var published: URL?
+            var document = snapshot()
+            var libraryProblem: Error?
             do {
-                let stored = try await Task.detached(priority: .userInitiated) {
-                    try library.save(snapshot, original: original, categoryID: chosenCategory)
-                }.value
-                saved = true
-                currentDocument = stored
-                name.stringValue = stored.name
-                hasEdits = false
-                window.isDocumentEdited = false
-                window.title = stored.name + " — " + EditorCopy.editor
-                if export {
+                document = try await saveCurrentEdits()
+                name.stringValue = document.name
+            } catch { libraryProblem = error }
+
+            let stored = document, original = self.original, library = self.library
+            var published: URL?
+            var exportProblem: Error?
+            if export {
+                do {
                     let pdf = try await Task.detached(priority: .userInitiated) {
-                        try EditorExport.write(stored, original: original)
+                        try EditorExport.write(stored, original: original, folder: library.outputFolder,
+                                               legacyFolders: library.legacyOutputFolders)
                     }.value
                     published = pdf
-                    try await Task.detached {
-                        try library.recordExport(pdf, for: stored.id)
-                    }.value
-                }
-                window.endSheet(progress)
-                isBusy = false
-                detail.stringValue = stored.id == snapshot.id ? EditorCopy.saved
-                    : L("另一份编辑也已保留，当前版本已另存为副本", "Another edit was saved. This version is saved as a copy.")
-                detail.toolTip = detail.stringValue
-                if let pdf = published {
-                    NSWorkspace.shared.activateFileViewerSelecting([pdf])
-                    NSWorkspace.shared.open(pdf)
+                    if libraryProblem == nil {
+                        do { try await Task.detached { try library.recordExport(pdf, for: stored.id) }.value }
+                        catch { libraryProblem = error }
+                    }
+                } catch { exportProblem = error }
+            }
+            window.endSheet(progress)
+            isBusy = false
+            if let published {
+                showExportedFiles(published)
+                if let libraryProblem {
+                    showError(libraryProblem.localizedDescription, title: EditorCopy.exportedWithoutLibrary)
+                } else if stored.layers.contains(where: { $0.kind == .mosaic }),
+                          !UserDefaults.standard.bool(forKey: "explainedPrivateRedactionOriginal") {
+                    UserDefaults.standard.set(true, forKey: "explainedPrivateRedactionOriginal")
+                    let notice = NSAlert()
+                    notice.messageText = EditorCopy.redactionExported
+                    notice.informativeText = EditorCopy.privateOriginalNotice
+                    notice.beginSheetModal(for: window, completionHandler: nil)
                 }
                 completion?(true)
-            } catch {
-                window.endSheet(progress)
-                isBusy = false
-                if let pdf = published {
-                    NSWorkspace.shared.activateFileViewerSelecting([pdf])
-                    showError(error.localizedDescription, title: L("文件已导出，图库文件名索引更新失败", "Files exported. The library filename index could not be updated."))
-                } else {
-                    showError(error.localizedDescription, title: saved ? EditorCopy.savedExportFailed : EditorCopy.failed)
-                }
+            } else if let exportProblem {
+                let message = [exportProblem.localizedDescription, libraryProblem?.localizedDescription]
+                    .compactMap { $0 }.joined(separator: "\n")
+                showError(message, title: libraryProblem == nil ? EditorCopy.savedExportFailed : EditorCopy.failed)
                 completion?(false)
+            } else if let libraryProblem {
+                showError(libraryProblem.localizedDescription)
+                completion?(false)
+            } else {
+                completion?(true)
             }
         }
     }
@@ -547,6 +623,14 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     func reviewBeforeClosing(_ completion: @escaping (Bool) -> Void) {
         guard let sender = window, !isBusy, sender.attachedSheet == nil else { completion(false); return }
         canvas.finishTextEditing()
+        autosave?.cancel()
+        if let activeSave {
+            Task {
+                _ = await activeSave.result
+                reviewBeforeClosing(completion)
+            }
+            return
+        }
         guard hasEdits else { sender.close(); completion(true); return }
         let alert = NSAlert()
         alert.messageText = EditorCopy.unsaved
@@ -565,7 +649,9 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
             case .alertThirdButtonReturn:
                 sender.close()
                 completion(true)
-            default: completion(false)
+            default:
+                scheduleAutosave()
+                completion(false)
             }
         }
     }
@@ -577,6 +663,8 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     }
 
     func windowWillClose(_ notification: Notification) {
+        autosave?.cancel()
+        categoryRefresh?.cancel()
         NotificationCenter.default.removeObserver(self)
         onClose?()
     }
@@ -615,11 +703,33 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
 /// All export surfaces use one flattened raster. In particular a redacted PDF
 /// contains no selectable text or original image hidden beneath a mosaic.
 enum EditorExport {
-    static func write(_ document: EditDocument, original: CGImage, folder: URL = Exporter.outputFolder) throws -> URL {
-        let composite = try EditRenderer(original: original).flattened(layers: document.layers)
+    static func write(_ document: EditDocument, original: CGImage, folder: URL = Exporter.outputFolder,
+                      legacyFolders: [URL] = []) throws -> URL {
         var record = document.record
         record.editingProjectID = document.id
         record.editLayerCount = document.layers.count
-        return try Exporter.export(composite, record: record, folder: folder, name: document.name)
+        let stem = Exporter.fileStem(for: record, name: document.name)
+        let destination = previousOutput(for: document.id, stem: stem, preferred: folder, legacyFolders: legacyFolders)
+        return try Exporter.export(original, record: record, folder: destination, name: document.name, layers: document.layers)
+    }
+
+    /// v0.3 could save one private project but export it in the other interface language's
+    /// folder. Only select that older destination when both public files still match its record.
+    private static func previousOutput(for id: UUID, stem: String, preferred: URL, legacyFolders: [URL]) -> URL {
+        let alternatives = legacyFolders.filter { $0 != preferred }
+        guard !alternatives.isEmpty else { return preferred }
+        struct Identity: Decodable { let editingProjectID: UUID; let pngSHA256: String; let pdfSHA256: String }
+        func identity(in folder: URL) -> Identity? {
+            let url = folder.appendingPathComponent(stem + ".json")
+            guard let data = try? Data(contentsOf: url), let identity = try? JSONDecoder().decode(Identity.self, from: data),
+                  identity.editingProjectID == id else { return nil }
+            return identity
+        }
+        if identity(in: preferred) != nil { return preferred }
+        return alternatives.first { folder in
+            guard let prior = identity(in: folder) else { return false }
+            return (try? Exporter.sha256(of: folder.appendingPathComponent(stem + ".png"))) == prior.pngSHA256
+                && (try? Exporter.sha256(of: folder.appendingPathComponent(stem + ".pdf"))) == prior.pdfSHA256
+        } ?? preferred
     }
 }

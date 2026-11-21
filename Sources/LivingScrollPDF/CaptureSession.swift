@@ -25,6 +25,7 @@ final class CaptureSession {
     private var timer: Timer?
     private var inFlight = false
     private var finishing = false
+    var isFinishing: Bool { finishing && !ended }
     private var autoScroll = false
     /// Auto-scroll step size; resamples, backs up and halves after a lost frame.
     private var pacer = AutoPacer()
@@ -516,13 +517,14 @@ final class CaptureSession {
                     cont.resume(returning: (image, rec))
                 }
             }
-            close()
             defer { end() }
             guard let (image, record) = captured else {
+                close()
                 alert(L("没有截到画面", "Nothing was captured"), L("请确认已在 系统设置 › 隐私与安全性 › 屏幕与系统录音 里打开卷轴PDF。", "Check that Living Scroll PDF is on in System Settings › Privacy & Security › Screen & System Audio Recording."))
                 return
             }
             if ProcessInfo.processInfo.environment["JZ_TEST_OWNER"] != nil {
+                close()
                 do {
                     let pdf = try await Task.detached { try Exporter.export(image, record: record) }.value
                     print("exported \(pdf.path)")
@@ -530,7 +532,11 @@ final class CaptureSession {
                     alert(L("保存失败", "Couldn't save"), error.localizedDescription)
                 }
             } else {
-                AppDelegate.shared?.editCapture(image, record: record)
+                let draft = await Task.detached(priority: .userInitiated) {
+                    AppDelegate.saveCapture(image, record: record)
+                }.value
+                close()
+                AppDelegate.shared?.present(draft.document, original: image, saveError: draft.error)
             }
         }
     }

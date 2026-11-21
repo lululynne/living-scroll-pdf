@@ -12,16 +12,15 @@ final class EditCanvas: NSView, NSTextViewDelegate {
             finishTextEditing()
             cancelDrag()
             if tool != nil { select(nil) }
-            if tool != nil { select(nil) }
             window?.invalidateCursorRects(for: self)
         }
     }
     var ink = InkColor.coral {
-        didSet { if ink != oldValue, let textEditor { style(textEditor) } }
+        didSet { if ink != oldValue, let textEditor { style(textEditor); onChange?() } }
     }
     var strokeWidth: CGFloat = 6
     var textSize: CGFloat = 28 {
-        didSet { if textSize != oldValue, let textEditor { style(textEditor) } }
+        didSet { if textSize != oldValue, let textEditor { style(textEditor); onChange?() } }
     }
     var onChange: (() -> Void)?
     var onSelectionChange: (() -> Void)?
@@ -59,17 +58,23 @@ final class EditCanvas: NSView, NSTextViewDelegate {
     private var moved = false
     private var textEditor: CanvasTextView?
     private var editingLayer: EditLayer?
+    private var typingID = UUID()
     private var textAnchor = CGPoint.zero
 
-    init(original: CGImage, layers: [EditLayer]) {
+    init(original: CGImage, layers: [EditLayer], pointScale: Double = 1) {
         self.layers = layers
-        renderer = EditRenderer(original: original)
+        renderer = EditRenderer(original: original, pointScale: pointScale)
         super.init(frame: CGRect(x: 0, y: 0, width: original.width, height: original.height))
         cache.totalCostLimit = 64 << 20
         setAccessibilityLabel(L("长截图编辑画布", "Scrolling screenshot canvas"))
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+
+    func releaseRenderCaches() {
+        cache.removeAllObjects()
+        renderer.discardCachedImages()
+    }
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     private var zoom: CGFloat { max(0.001, enclosingScrollView?.magnification ?? 1) }
@@ -460,6 +465,7 @@ final class EditCanvas: NSView, NSTextViewDelegate {
         cancelDrag()
         select(layer)
         editingLayer = layer
+        typingID = layer?.id ?? UUID()
         textAnchor = anchor
         let editor = CanvasTextView(frame: .zero)
         textEditor = editor
@@ -506,7 +512,10 @@ final class EditCanvas: NSView, NSTextViewDelegate {
     }
 
     func textDidChange(_ notification: Notification) {
-        if let editor = textEditor { layoutTextEditor(editor) }
+        if let editor = textEditor {
+            layoutTextEditor(editor)
+            onChange?()
+        }
     }
 
     func textDidEndEditing(_ notification: Notification) {
@@ -516,10 +525,35 @@ final class EditCanvas: NSView, NSTextViewDelegate {
 
     func finishTextEditing() { endText(commit: true) }
 
+    /// Autosave even while the insertion point is still in a text annotation.
+    /// Capturing the draft leaves keyboard focus, marked text and the undo stack alone.
+    var layersForSaving: [EditLayer] {
+        guard let editor = textEditor else { return layers }
+        var snapshot = layers
+        let draft = textLayer(editor.string)
+        if let old = editingLayer, let i = snapshot.firstIndex(where: { $0.id == old.id }) {
+            if let draft { snapshot[i] = draft } else { snapshot.remove(at: i) }
+        } else if let draft {
+            snapshot.append(draft)
+        }
+        return snapshot
+    }
+
+    private func textLayer(_ value: String) -> EditLayer? {
+        guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        if let old = editingLayer, old.text == value, old.fontSize == textSize, old.color == ink { return old }
+        var updated = editingLayer ?? EditLayer(id: typingID, kind: .text, rect: .zero)
+        updated.text = value
+        updated.color = ink
+        updated.fontSize = textSize
+        updated.rect = CGRect(origin: textAnchor, size: EditRenderer.textSize(value, fontSize: textSize))
+        return updated
+    }
+
     private func endText(commit save: Bool, restoreFocus: Bool = true) {
         guard let editor = textEditor else { return }
         let old = editingLayer
-        let value = editor.string
+        let updated = textLayer(editor.string)
         let hadFocus = window?.firstResponder === editor
         editingLayer = nil
         textEditor = nil
@@ -527,18 +561,9 @@ final class EditCanvas: NSView, NSTextViewDelegate {
         editor.removeFromSuperview()
         invalidateOutline(old)
         if hadFocus && restoreFocus { window?.makeFirstResponder(self) }
-        guard save else { return }
-        if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            if let old { commit(before: old, after: nil) }
-            return
-        }
-        if let old, old.text == value, old.fontSize == textSize, old.color == ink { return }
-        var updated = old ?? EditLayer(kind: .text, rect: .zero)
-        updated.text = value
-        updated.color = ink
-        updated.fontSize = textSize
-        updated.rect = CGRect(origin: textAnchor, size: EditRenderer.textSize(value, fontSize: textSize))
-        commit(before: old, after: updated)
+        guard old != updated else { return }
+        if save { commit(before: old, after: updated) }
+        else { onChange?() } // Escape also rolls back a draft already autosaved to disk.
     }
 }
 

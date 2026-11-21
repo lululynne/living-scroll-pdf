@@ -3,7 +3,8 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
-    private let library = ScrollLibrary.shared
+    private let library: ScrollLibrary
+    private let onDelete: (UUID) -> Void
     private let onOpen: (UUID) -> Void
     private let categoryPicker = NSPopUpButton()
     private let manage = NSButton()
@@ -12,6 +13,7 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
     private let empty = NSTextField(wrappingLabelWithString: "")
     private let importButton = NSButton()
     private let openButton = NSButton()
+    private let deleteButton = NSButton()
     private let spinner = NSProgressIndicator()
     private var categories: [ScrollCategory] = []
     private var rows: [ScrollEntry] = []
@@ -19,8 +21,11 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
     private var loading = false
     private let dates = DateFormatter()
     private var displayedChinese: Bool?
+    private var reload: Task<Void, Never>?
 
-    init(onOpen: @escaping (UUID) -> Void) {
+    init(library: ScrollLibrary = .shared, onDelete: @escaping (UUID) -> Void, onOpen: @escaping (UUID) -> Void) {
+        self.library = library
+        self.onDelete = onDelete
         self.onOpen = onOpen
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 500),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -34,7 +39,7 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
         buildContent()
         applyLanguage()
         NotificationCenter.default.addObserver(self, selector: #selector(libraryChanged(_:)),
-                                                name: .scrollLibraryDidChange, object: nil)
+                                                name: .scrollLibraryDidChange, object: library)
         NotificationCenter.default.addObserver(self, selector: #selector(defaultsChanged(_:)),
                                                 name: UserDefaults.didChangeNotification, object: UserDefaults.standard)
     }
@@ -102,10 +107,15 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
         openButton.keyEquivalent = "\r"
         openButton.target = self
         openButton.action = #selector(openRow(_:))
+        openButton.isEnabled = false
+        deleteButton.bezelStyle = .rounded
+        deleteButton.target = self
+        deleteButton.action = #selector(confirmDeletion)
+        deleteButton.isEnabled = false
         spinner.style = .spinning
         spinner.controlSize = .small
         spinner.isDisplayedWhenStopped = false
-        let footer = NSStackView(views: [importButton, spinner, NSView(), openButton])
+        let footer = NSStackView(views: [importButton, spinner, NSView(), deleteButton, openButton])
         footer.alignment = .centerY
         for v in [bar, scroll, empty, footer] {
             content.addSubview(v)
@@ -156,6 +166,7 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
         }
         importButton.title = L("打开已有 PNG…", "Open Existing PNG…")
         openButton.title = L("继续编辑", "Continue Editing")
+        deleteButton.title = EditorCopy.deleteCapture
     }
 
     @objc private func libraryChanged(_ notification: Notification) {
@@ -163,30 +174,45 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
     }
 
     private func refresh() {
-        do {
-            categories = try library.categories()
-            if case .category(let id) = filter, !categories.contains(where: { $0.id == id }) { filter = .uncategorized }
-            categoryPicker.removeAllItems()
-            categoryPicker.addItems(withTitles: [L("全部分类", "All Categories"), EditorCopy.uncategorized])
-            if !categories.isEmpty { categoryPicker.menu?.addItem(.separator()) }
-            for category in categories {
-                let item = NSMenuItem(title: category.name, action: nil, keyEquivalent: "")
-                item.representedObject = category.id
-                categoryPicker.menu?.addItem(item)
-            }
-            switch filter {
-            case .all: categoryPicker.selectItem(at: 0)
-            case .uncategorized: categoryPicker.selectItem(at: 1)
-            case .category(let id):
-                categoryPicker.select(categoryPicker.itemArray.first { $0.representedObject as? UUID == id })
-            }
-            try reloadRows()
-        } catch { showError(error) }
+        reload?.cancel()
+        let library = self.library, query = search.stringValue, requested = filter
+        reload = Task {
+            do {
+                let (available, current, entries) = try await Task.detached(priority: .userInitiated) {
+                    let available = try library.categories()
+                    var current = requested
+                    if case .category(let id) = current, !available.contains(where: { $0.id == id }) { current = .uncategorized }
+                    return (available, current, try library.entries(matching: query, category: current))
+                }.value
+                guard !Task.isCancelled else { return }
+                categories = available
+                filter = current
+                updateFilter()
+                showRows(entries)
+            } catch { if !Task.isCancelled { showError(error) } }
+        }
     }
 
-    private func reloadRows() throws {
+    private func updateFilter() {
+        categoryPicker.removeAllItems()
+        categoryPicker.addItems(withTitles: [L("全部分类", "All Categories"), EditorCopy.uncategorized])
+        if !categories.isEmpty { categoryPicker.menu?.addItem(.separator()) }
+        for category in categories {
+            let item = NSMenuItem(title: category.name, action: nil, keyEquivalent: "")
+            item.representedObject = category.id
+            categoryPicker.menu?.addItem(item)
+        }
+        switch filter {
+        case .all: categoryPicker.selectItem(at: 0)
+        case .uncategorized: categoryPicker.selectItem(at: 1)
+        case .category(let id):
+            categoryPicker.select(categoryPicker.itemArray.first { $0.representedObject as? UUID == id })
+        }
+    }
+
+    private func showRows(_ entries: [ScrollEntry]) {
         let selected = selectedID
-        rows = try library.entries(matching: search.stringValue, category: filter)
+        rows = entries
         table.reloadData()
         table.deselectAll(nil)
         if let selected, let index = rows.firstIndex(where: { $0.id == selected }) {
@@ -197,16 +223,17 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
             : L("没有匹配的长截图。", "No matching screenshots.")
         empty.isHidden = !rows.isEmpty
         openButton.isEnabled = selectedID != nil
+        deleteButton.isEnabled = selectedID != nil
     }
 
     @objc private func selectCategory() {
         if let id = categoryPicker.selectedItem?.representedObject as? UUID { filter = .category(id) }
         else { filter = categoryPicker.indexOfSelectedItem == 1 ? .uncategorized : .all }
-        do { try reloadRows() } catch { showError(error) }
+        refresh()
     }
 
     func controlTextDidChange(_ obj: Notification) {
-        do { try reloadRows() } catch { showError(error) }
+        refresh()
     }
 
     private var selectedID: UUID? {
@@ -250,6 +277,28 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         openButton.isEnabled = selectedID != nil
+        deleteButton.isEnabled = selectedID != nil
+    }
+
+    @objc private func confirmDeletion() {
+        guard let window, let id = selectedID, let entry = rows.first(where: { $0.id == id }) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = EditorCopy.confirmDeleteCapture(entry.name)
+        alert.informativeText = EditorCopy.deleteCaptureDetails
+        alert.addButton(withTitle: EditorCopy.cancel).keyEquivalent = "\u{1b}"
+        alert.addButton(withTitle: EditorCopy.deleteCapture).hasDestructiveAction = true
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertSecondButtonReturn, let self else { return }
+            Task {
+                do {
+                    let library = self.library
+                    try await Task.detached(priority: .userInitiated) { try library.delete(id) }.value
+                    self.onDelete(id)
+                    self.refresh()
+                } catch { self.showError(error) }
+            }
+        }
     }
 
     @objc private func openRow(_ sender: NSControl) {

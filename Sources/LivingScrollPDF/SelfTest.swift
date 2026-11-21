@@ -832,29 +832,34 @@ enum SelfTest {
             let rec = CaptureRecord(appName: "SelfTest", windowTitle: "synthetic", startedAt: Date(), endedAt: Date(),
                                     framesStitched: s.acceptedFrames, droppedFrames: s.lostFrames, pixelWidth: img.width,
                                     pixelHeight: img.height, pointScale: 2)
-            let pdf = try Exporter.export(img, record: rec, folder: dir)
+            let pdf = try Exporter.export(img, record: rec, folder: dir, layout: .long)
             let pages = CGPDFDocument(pdf as CFURL)?.numberOfPages ?? 0
             check("long pdf is one page", pages == 1, "pages=\(pages)")
-            let a4 = dir.appendingPathComponent("a4.pdf")
-            let a4Pages = try Exporter.writePDF(img, scale: 2, layout: .a4, record: rec, to: a4)
-            check("a4 pdf paginated", a4Pages > 1 && CGPDFDocument(a4 as CFURL)?.numberOfPages == a4Pages, "pages=\(a4Pages)")
-            let again = try Exporter.export(img, record: rec, folder: dir)
-            check("same-second export does not overwrite", again != pdf, again.lastPathComponent)
+            let a4 = try Exporter.export(img, record: rec, folder: dir, name: "a4", layout: .a4)
+            let a4Pages = CGPDFDocument(a4 as CFURL)?.numberOfPages ?? 0
+            let a4Record = try JSONSerialization.jsonObject(with: Data(contentsOf: a4.deletingPathExtension().appendingPathExtension("json"))) as? [String: Any]
+            check("a4 pdf paginated", a4Pages > 1 && a4Record?["pdfPages"] as? Int == a4Pages, "pages=\(a4Pages)")
+            let again = try Exporter.export(img, record: rec, folder: dir, layout: .long)
+            check("same name replaces the existing export", again == pdf, again.lastPathComponent)
             var partial = rec
             partial.isPartial = true; partial.partialReason = "ended-before-reconnecting"
             let partialPDF = try Exporter.export(img, record: partial, folder: dir)
             let partialJSON = partialPDF.deletingPathExtension().appendingPathExtension("json")
             let object = try JSONSerialization.jsonObject(with: Data(contentsOf: partialJSON)) as? [String: Any]
-            let subject = CGPDFDocument(partialPDF as CFURL).flatMap { pdf -> String? in
+            let partialDocument = CGPDFDocument(partialPDF as CFURL)
+            let info = partialDocument?.info
+            func pdfString(_ key: String) -> String? {
                 var value: CGPDFStringRef?
-                guard let info = pdf.info, CGPDFDictionaryGetString(info, "Subject", &value), let value else { return nil }
+                guard let info, CGPDFDictionaryGetString(info, key, &value), let value else { return nil }
                 return CGPDFStringCopyTextString(value) as String?
-            } ?? ""
-            check("partial export: file name, JSON and PDF subject say so",
+            }
+            check("partial export: file name and public JSON preserve the gap reason",
                   partialPDF.lastPathComponent.contains(L("未完成", "partial")) && object?["isPartial"] as? Bool == true
-                  && object?["partialReason"] as? String == "ended-before-reconnecting" && object?["gaps"] == nil
-                  && subject.contains(L("未完成", "PARTIAL")),
-                  "\(partialPDF.lastPathComponent) subject=\(subject)")
+                  && object?["partialReason"] as? String == "ended-before-reconnecting" && object?["gaps"] == nil,
+                  partialPDF.lastPathComponent)
+            check("PDF info contains only the app name and creation date",
+                  info.map { CGPDFDictionaryGetCount($0) } == 2 && pdfString("Title") == rec.appName
+                  && pdfString("CreationDate")?.hasPrefix("D:") == true && object?["windowTitle"] as? String == "")
             var gapped = partial
             gapped.gaps = [ContentGap(afterRow: img.height, droppedFrames: 3, reason: "ended-before-reconnecting")]
             let gapPDF = try Exporter.export(img, record: gapped, folder: dir)

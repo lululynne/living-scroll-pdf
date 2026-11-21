@@ -7,22 +7,27 @@ import ImageIO
 /// The canvas and the flattened export use the same rasterizer and tile boundaries.
 final class EditRenderer {
     private static let tileSide = 512
-    private static let mosaicSide = 16
     private let original: CGImage
     private let bounds: CGRect
-    private let colorSpace: CGColorSpace
-    private let componentBits: Int
+    let colorSpace: CGColorSpace
+    let componentBits: Int
+    private let pointScale: Double
     private let images = NSCache<NSUUID, DecodedImage>()
 
-    init(original: CGImage) {
+    init(original: CGImage, pointScale: Double = 1) {
         self.original = original
+        self.pointScale = pointScale.isFinite ? max(1, pointScale) : 1
         bounds = CGRect(x: 0, y: 0, width: original.width, height: original.height)
         let profile = original.colorSpace
         if let profile, profile.model == .rgb { colorSpace = profile }
         else if let base = profile?.baseColorSpace, base.model == .rgb { colorSpace = base }
         else { colorSpace = Stitcher.colorSpace }
         componentBits = original.bitsPerComponent > 8 ? 16 : 8
-        images.totalCostLimit = 48 << 20
+        images.totalCostLimit = min(32 << 20, max(1 << 20, original.bytesPerRow * original.height / 8))
+    }
+
+    func discardCachedImages() {
+        images.removeAllObjects()
     }
 
     func tiles(in rect: CGRect) -> [CGRect] {
@@ -49,13 +54,7 @@ final class EditRenderer {
             return crop
         }
 
-        // Complete mosaic cells are needed even if a caller asks for a sub-tile crop.
-        // Regular 512-pixel canvas tiles are already aligned to this grid.
-        let side = CGFloat(Self.mosaicSide)
-        let x = floor(requested.minX / side) * side
-        let y = floor(requested.minY / side) * side
-        let region = bounds.intersection(CGRect(x: x, y: y, width: ceil(requested.maxX / side) * side - x,
-                                                height: ceil(requested.maxY / side) * side - y))
+        let region = sourceRegion(for: requested, layers: layers)
         let context = try bitmap(width: Int(region.width), height: Int(region.height))
         guard let background = original.cropping(to: region) else { throw Failure.bitmap }
         context.setBlendMode(.copy)
@@ -76,6 +75,30 @@ final class EditRenderer {
         return crop
     }
 
+    /// A later mosaic averages pixels painted by earlier layers. Walk backwards
+    /// so two overlapping mosaics with different cell sizes agree across tile edges.
+    private func sourceRegion(for requested: CGRect, layers: [EditLayer]) -> CGRect {
+        var region = requested
+        for layer in layers.reversed() where layer.kind == .mosaic {
+            let selection = layer.rect.standardized.intersection(bounds)
+            let hit = region.intersection(selection)
+            guard !hit.isEmpty else { continue }
+            let side = CGFloat(mosaicSide(for: selection))
+            let x = floor(hit.minX / side) * side, y = floor(hit.minY / side) * side
+            let cells = CGRect(x: x, y: y, width: ceil(hit.maxX / side) * side - x,
+                               height: ceil(hit.maxY / side) * side - y)
+            region = region.union(cells.intersection(selection).integral)
+        }
+        return region.intersection(bounds)
+    }
+
+    func mosaicSide(for selection: CGRect) -> Int {
+        let short = min(selection.width, selection.height)
+        let side = max(ceil(16 * pointScale), (short / 12).rounded())
+        // A cell larger than the full image already covers every pixel.
+        return Int(min(max(16, bounds.width, bounds.height), side))
+    }
+
     func flattened(layers: [EditLayer]) throws -> CGImage {
         guard !layers.isEmpty else { return original }
         let context = try bitmap(width: original.width, height: original.height)
@@ -93,7 +116,7 @@ final class EditRenderer {
         return result
     }
 
-    private func bitmap(width: Int, height: Int) throws -> CGContext {
+    func bitmap(width: Int, height: Int) throws -> CGContext {
         let order = componentBits == 16 ? CGBitmapInfo.byteOrder16Little.rawValue : 0
         guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: componentBits,
                                       bytesPerRow: width * 4 * componentBits / 8, space: colorSpace,
@@ -131,9 +154,14 @@ final class EditRenderer {
             context.addPath(path)
             context.strokePath()
         case .mosaic:
-            try pixelate(rect.intersection(region).offsetBy(dx: -region.minX, dy: -region.minY), in: context)
+            try pixelate(rect, region: region, in: context)
         case .image:
-            let image = try decodedImage(for: layer)
+            let decoded = try decodedImage(for: layer)
+            if case .strips(let png) = decoded.storage {
+                try png.draw(in: context, rect: rect, region: region)
+                return
+            }
+            guard case .raster(let image) = decoded.storage else { return }
             context.translateBy(x: rect.minX, y: rect.maxY)
             context.scaleBy(x: 1, y: -1)
             context.interpolationQuality = .high
@@ -170,27 +198,32 @@ final class EditRenderer {
 
     /// Average premultiplied RGBA from the *current* bitmap, including earlier annotations.
     /// Only pixels whose centres fall inside the selected rectangle participate or change.
-    private func pixelate(_ selection: CGRect, in context: CGContext) throws {
-        guard !selection.isEmpty else { return }
+    private func pixelate(_ rect: CGRect, region: CGRect, in context: CGContext) throws {
+        let hit = rect.intersection(region)
+        guard !hit.isEmpty else { return }
+        let selection = hit.offsetBy(dx: -region.minX, dy: -region.minY)
+        let side = mosaicSide(for: rect.intersection(bounds))
         context.flush()
         guard let data = context.data else { throw Failure.bitmap }
         if componentBits == 16 {
-            averageCells(selection, in: context, pixels: data.assumingMemoryBound(to: UInt16.self))
+            averageCells(selection, origin: region.origin, side: side, in: context, pixels: data.assumingMemoryBound(to: UInt16.self))
         } else {
-            averageCells(selection, in: context, pixels: data.assumingMemoryBound(to: UInt8.self))
+            averageCells(selection, origin: region.origin, side: side, in: context, pixels: data.assumingMemoryBound(to: UInt8.self))
         }
     }
 
-    private func averageCells<T: FixedWidthInteger & UnsignedInteger>(_ selection: CGRect, in context: CGContext,
-                                                                      pixels: UnsafeMutablePointer<T>) {
+    private func averageCells<T: FixedWidthInteger & UnsignedInteger>(_ selection: CGRect, origin: CGPoint, side: Int,
+                                                                      in context: CGContext, pixels: UnsafeMutablePointer<T>) {
         let strideInComponents = context.bytesPerRow / MemoryLayout<T>.stride
         let x0 = max(0, Int(ceil(selection.minX - 0.5))), x1 = min(context.width, Int(ceil(selection.maxX - 0.5)))
         let y0 = max(0, Int(ceil(selection.minY - 0.5))), y1 = min(context.height, Int(ceil(selection.maxY - 0.5)))
         guard x0 < x1, y0 < y1 else { return }
-        let side = Self.mosaicSide
-        for cellY in stride(from: y0 / side * side, to: y1, by: side) {
+        // The grid is in image coordinates, even when this bitmap is a small crop.
+        let firstY = (Int(origin.y) + y0) / side * side - Int(origin.y)
+        let firstX = (Int(origin.x) + x0) / side * side - Int(origin.x)
+        for cellY in stride(from: firstY, to: y1, by: side) {
             let rows = max(y0, cellY)..<min(y1, cellY + side)
-            for cellX in stride(from: x0 / side * side, to: x1, by: side) {
+            for cellX in stride(from: firstX, to: x1, by: side) {
                 let columns = max(x0, cellX)..<min(x1, cellX + side)
                 var sums = SIMD4<Int>(repeating: 0)
                 for row in rows {
@@ -235,27 +268,31 @@ final class EditRenderer {
     }
 
     private final class DecodedImage {
+        enum Storage {
+            case raster(CGImage)
+            case strips(StripedLayerPNG)
+        }
         let data: Data
-        let image: CGImage
+        let storage: Storage
         let sourceSide: Int
         let decodedSide: Int
 
-        init(_ data: Data, _ image: CGImage, sourceSide: Int, decodedSide: Int) {
+        init(_ data: Data, _ storage: Storage, sourceSide: Int, decodedSide: Int) {
             self.data = data
-            self.image = image
+            self.storage = storage
             self.sourceSide = sourceSide
             self.decodedSide = decodedSide
         }
     }
 
-    private func decodedImage(for layer: EditLayer) throws -> CGImage {
+    private func decodedImage(for layer: EditLayer) throws -> DecodedImage {
         guard let data = layer.imageData else { throw Failure.image }
         let key = layer.id as NSUUID
         let needed = max(1, max(layer.rect.width, layer.rect.height))
         let requestedSide = ceil(needed / 256) * 256
-        if let cached = images.object(forKey: key), cached.data == data,
-           cached.decodedSide == Int(min(CGFloat(cached.sourceSide), requestedSide)) {
-            return cached.image
+        if let cached = images.object(forKey: key), cached.data == data {
+            if case .strips = cached.storage { return cached }
+            if cached.decodedSide == Int(min(CGFloat(cached.sourceSide), requestedSide)) { return cached }
         }
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
@@ -265,6 +302,13 @@ final class EditRenderer {
         // on every tile. Grow the cached raster in steps as the image is resized.
         let longest = max(width, height)
         let limit = Int(min(CGFloat(longest), requestedSide))
+        let depth = (properties[kCGImagePropertyDepth] as? Int ?? 8) > 8 ? 8 : 4
+        if Double(width) * Double(height) * Double(depth) > Double(images.totalCostLimit),
+           let png = try StripedLayerPNG(data) {
+            let result = DecodedImage(data, .strips(png), sourceSide: longest, decodedSide: 0)
+            images.setObject(result, forKey: key)
+            return result
+        }
         let decoded: CGImage?
         if limit == longest {
             decoded = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
@@ -275,9 +319,9 @@ final class EditRenderer {
             decoded = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
         }
         guard let image = decoded else { throw Failure.image }
-        images.setObject(DecodedImage(data, image, sourceSide: longest, decodedSide: limit),
-                         forKey: key, cost: image.bytesPerRow * image.height)
-        return image
+        let result = DecodedImage(data, .raster(image), sourceSide: longest, decodedSide: limit)
+        images.setObject(result, forKey: key, cost: image.bytesPerRow * image.height)
+        return result
     }
 
     private enum Failure: LocalizedError {

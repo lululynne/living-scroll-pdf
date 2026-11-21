@@ -1,5 +1,6 @@
 import CoreGraphics
 import CryptoKit
+import Darwin
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -7,6 +8,7 @@ import UniformTypeIdentifiers
 struct CaptureRecord: Codable {
     var tool = "卷轴PDF · Living Scroll PDF \(Exporter.version)"
     var appName: String
+    /// Private projects retain the title; public records keep an empty string for older readers.
     var windowTitle: String
     var startedAt: Date
     var endedAt: Date
@@ -71,10 +73,29 @@ enum Exporter {
     /// 200 inches: the largest page Acrobat and most viewers accept.
     static let maxPagePoints = 14_400
 
-    static var outputFolder: URL {
-        if let custom = ProcessInfo.processInfo.environment["JZ_OUT"] { return URL(fileURLWithPath: custom) }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Desktop/" + L("卷轴PDF", "Living Scroll PDF"), isDirectory: true)
+    static var outputFolder: URL { outputFolders[0] }
+
+    /// Keep a capture's public filename stable across language changes and relaunches.
+    /// Both historical names are still checked for interrupted exports and old libraries.
+    static var outputFolders: [URL] {
+        if let custom = ProcessInfo.processInfo.environment["JZ_OUT"] { return [URL(fileURLWithPath: custom, isDirectory: true)] }
+        let desktop = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop", isDirectory: true)
+        let defaults = UserDefaults.standard, key = "desktopExportFolderName"
+        let saved = defaults.string(forKey: key)
+        let folders = desktopFolders(in: desktop, preferredName: L("卷轴PDF", "Living Scroll PDF"), savedName: saved)
+        if saved != folders[0].lastPathComponent { defaults.set(folders[0].lastPathComponent, forKey: key) }
+        return folders
+    }
+
+    static func desktopFolders(in desktop: URL, preferredName: String, savedName: String?) -> [URL] {
+        let folders = ["Living Scroll PDF", "卷轴PDF"].map { desktop.appendingPathComponent($0, isDirectory: true) }
+        let fm = FileManager.default
+        let primary = folders.first { $0.lastPathComponent == savedName }
+            ?? folders.first { fm.fileExists(atPath: $0.appendingPathComponent(".living-scroll-library/index.json").path) }
+            ?? folders.first { $0.lastPathComponent == preferredName && fm.fileExists(atPath: $0.path) }
+            ?? folders.first { fm.fileExists(atPath: $0.path) }
+            ?? folders.first { $0.lastPathComponent == preferredName } ?? folders[0]
+        return [primary] + folders.filter { $0 != primary }
     }
 
     static func fileStem(for record: CaptureRecord, name: String? = nil) -> String {
@@ -88,7 +109,7 @@ enum Exporter {
         }
         let unsafe = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/:\\"))
         let cleaned = supplied.components(separatedBy: unsafe).joined(separator: "-")
-        // Leave room for a collision suffix and extension even with multibyte filenames.
+        // Leave room for the partial marker and extension even with multibyte filenames.
         var stem = ""
         for character in cleaned {
             if stem.utf8.count + String(character).utf8.count > 220 { break }
@@ -101,56 +122,37 @@ enum Exporter {
         return stem
     }
 
-    /// Form all three files in private first. The record appears only after both
-    /// final payloads exist, and a name collision never replaces an older capture.
-    static func export(_ image: CGImage, record: CaptureRecord, folder: URL = outputFolder, name: String? = nil) throws -> URL {
-        let fm = FileManager.default
-        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
-        let staging = folder.appendingPathComponent(".export-" + UUID().uuidString, isDirectory: true)
-        try fm.createDirectory(at: staging, withIntermediateDirectories: false)
-        defer { try? fm.removeItem(at: staging) }
-        let png = staging.appendingPathComponent("output.png")
-        let pdf = staging.appendingPathComponent("output.pdf")
-        let json = staging.appendingPathComponent("output.json")
-        try writePNG(image, to: png)
-        let pages = try writePDF(image, scale: record.pointScale, layout: pdfLayout, record: record, to: pdf)
-
-        var rec = record
-        rec.pdfPages = pages
-        rec.pngSHA256 = try sha256(of: png)
-        rec.pdfSHA256 = try sha256(of: pdf)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(rec).write(to: json)
-
-        let base = fileStem(for: record, name: name)
-        var suffix = 1
-        while true {
-            let stem = suffix == 1 ? base : "\(base)-\(suffix)"
-            let sources = [png, pdf, json]
-            let destinations = sources.map { folder.appendingPathComponent(stem + "." + $0.pathExtension) }
-            suffix += 1
-            if destinations.contains(where: { fm.fileExists(atPath: $0.path) }) { continue }
-            var published: [URL] = []
-            do {
-                // Same-volume hard links reserve names without clobbering a concurrent export.
-                // copyItem also refuses replacements and works on volumes without hard links.
-                for (source, destination) in zip(sources, destinations) {
-                    do {
-                        try fm.linkItem(at: source, to: destination)
-                    } catch let error as NSError where error.code != NSFileWriteFileExistsError {
-                        try fm.copyItem(at: source, to: destination)
-                    }
-                    published.append(destination)
-                }
-                return destinations[1]
-            } catch {
-                for url in published { try? fm.removeItem(at: url) }
-                if (error as NSError).code == NSFileWriteFileExistsError { continue }
-                throw error
-            }
+    /// Encode all of the new products before replacing any public file.
+    static func export(_ image: CGImage, record: CaptureRecord, folder: URL = outputFolder,
+                       name: String? = nil, layers: [EditLayer] = [], layout: PDFLayout = pdfLayout) throws -> URL {
+        let stem = fileStem(for: record, name: name)
+        return try ExportPublication.write(in: folder, stem: stem) { png, pdf, json in
+            let pages = try BandedExport.write(original: image, layers: layers, record: record,
+                                               layout: layout, png: png, pdf: pdf)
+            var published = record
+            published.windowTitle = ""
+            published.pdfPages = pages
+            published.pngSHA256 = try sha256(of: png)
+            published.pdfSHA256 = try sha256(of: pdf)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(published).write(to: json)
         }
+    }
+
+    static func recoverPendingExport(in folder: URL) throws {
+        try ExportPublication.recoverPending(in: folder)
+    }
+
+    /// Hex-encoded UTF-16BE is a PDF text string even for emoji, CJK, or literal delimiters.
+    static func pdfInfoObject(for record: CaptureRecord) -> String {
+        let title = record.appName.utf16.map { String(format: "%04X", $0) }.joined()
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMddHHmmss"
+        return "<< /Title <FEFF\(title)> /CreationDate (D:\(formatter.string(from: record.endedAt))Z) >>"
     }
 
     static func writePNG(_ image: CGImage, to url: URL) throws {
@@ -161,89 +163,30 @@ enum Exporter {
         guard CGImageDestinationFinalize(dest) else { throw ExportError.cannotCreate(url) }
     }
 
-    /// Writes the long image as one tall page, or as A4-proportioned pages; every cut is
-    /// nudged up to a blank row so lines of text are not sliced in half.
-    @discardableResult
-    static func writePDF(_ image: CGImage, scale: Double, layout: PDFLayout, record: CaptureRecord, to url: URL) throws -> Int {
-        let s = CGFloat(max(scale, 1))
-        let info: [CFString: Any] = [
-            kCGPDFContextTitle: "\(record.appName) · \(record.windowTitle)",
-            kCGPDFContextCreator: record.tool,
-            kCGPDFContextSubject: "Scrolling capture \(ISO8601DateFormatter().string(from: record.startedAt)) – \(ISO8601DateFormatter().string(from: record.endedAt))"
-                + (record.isPartial ? " · " + L("未完成", "PARTIAL") + ": \(record.partialReason ?? "")" : ""),
-        ]
-        guard let ctx = CGContext(url as CFURL, mediaBox: nil, info as CFDictionary) else {
-            throw ExportError.cannotCreate(url)
-        }
-        let cuts = pageCuts(image, pageHeight: pageHeight(image, scale: scale, layout: layout))
-        for (start, end) in zip(cuts, cuts.dropFirst()) {
-            guard let slice = image.cropping(to: CGRect(x: 0, y: start, width: image.width, height: end - start)) else { continue }
-            var box = CGRect(x: 0, y: 0, width: CGFloat(image.width) / s, height: CGFloat(end - start) / s)
-            ctx.beginPage(mediaBox: &box)
-            ctx.interpolationQuality = .high
-            ctx.draw(slice, in: box)
-            ctx.endPage()
-        }
-        ctx.closePDF()
-        return cuts.count - 1
-    }
-
     static func pageHeight(_ image: CGImage, scale: Double, layout: PDFLayout) -> Int {
         switch layout {
-        case .long: return Int(Double(maxPagePoints) * max(scale, 1))
+        case .long:
+            // A very large scale in an imported record still fits on one page.
+            let maxRows = Double(maxPagePoints) * max(scale.isFinite ? scale : 1, 1)
+            return Int(min(Double(image.height), maxRows))
         case .a4: return max(200, Int(Double(image.width) * 1.414))
         }
-    }
-
-    static func pageCuts(_ image: CGImage, pageHeight: Int) -> [Int] {
-        let w = image.width, h = image.height
-        guard h > pageHeight else { return [0, h] }
-        return withRGBA(image) { b in
-            var cuts = [0]
-            var start = 0
-            while h - start > pageHeight {
-                let target = start + pageHeight
-                var cut = target
-                for y in stride(from: target, to: target - pageHeight / 6, by: -1) where isQuietRow(b, width: w, y) {
-                    cut = y
-                    break
-                }
-                cuts.append(cut)
-                start = cut
-            }
-            cuts.append(h)
-            return cuts
-        }
-    }
-
-    /// Reads the stitched image's own pixel buffer when it is packed RGBA8 (it always is
-    /// for our captures), instead of rendering a second full-size copy.
-    private static func withRGBA<T>(_ image: CGImage, _ body: (UnsafeBufferPointer<UInt8>) -> T) -> T {
-        if image.bitsPerPixel == 32, image.bytesPerRow == image.width * 4,
-           image.alphaInfo == .premultipliedLast, let data = image.dataProvider?.data {
-            let count = CFDataGetLength(data)
-            return body(UnsafeBufferPointer(start: CFDataGetBytePtr(data), count: count))
-        }
-        let frame = PixelFrame(cgImage: image)!
-        return frame.bytes.withUnsafeBufferPointer(body)
-    }
-
-    private static func isQuietRow(_ b: UnsafeBufferPointer<UInt8>, width w: Int, _ y: Int) -> Bool {
-        let base = y * w * 4
-        let r = Int(b[base]), g = Int(b[base + 1]), bl = Int(b[base + 2])
-        var i = base
-        for _ in 0..<w {
-            if abs(Int(b[i]) - r) > 10 || abs(Int(b[i + 1]) - g) > 10 || abs(Int(b[i + 2]) - bl) > 10 { return false }
-            i += 4
-        }
-        return true
     }
 
     static func sha256(of url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hasher = SHA256()
-        while let chunk = try handle.read(upToCount: 4 << 20), !chunk.isEmpty { hasher.update(data: chunk) }
+        var finished = false
+        while !finished {
+            try autoreleasepool {
+                if let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+                    hasher.update(data: chunk)
+                } else {
+                    finished = true
+                }
+            }
+        }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
@@ -255,5 +198,127 @@ enum Exporter {
             case .cannotCreate(let url): return L("无法写入 \(url.path)", "Could not write \(url.path)")
             }
         }
+    }
+}
+
+/// The directory inode is the cross-process lock. A prepared transaction contains only
+/// the new public files. After a crash, the next writer finishes any remaining renames.
+/// The JSON hashes are published last; readers can verify the pair they opened.
+private enum ExportPublication {
+    private static let extensions = ["png", "pdf", "json"]
+    private static let owner = ".living-scroll-publication-v1"
+
+    static func write(in folder: URL, stem: String,
+                      render: (URL, URL, URL) throws -> Void) throws -> URL {
+        let fm = FileManager.default
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        return try withOutputLock(in: folder) {
+            let stage = stagingDirectory(in: folder)
+            try recover(stage: stage, in: folder)
+            return try write(stem: stem, in: folder, stage: stage, render: render)
+        }
+    }
+
+    static func recoverPending(in folder: URL) throws {
+        let stage = stagingDirectory(in: folder)
+        guard try attributes(of: stage) != nil else { return }
+        try withOutputLock(in: folder) { try recover(stage: stage, in: folder) }
+    }
+
+    private static func withOutputLock<T>(in folder: URL, _ action: () throws -> T) throws -> T {
+        let fd = Darwin.open(folder.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard fd >= 0 else { throw posixError() }
+        defer { Darwin.close(fd) }
+        while flock(fd, LOCK_EX) != 0 {
+            if errno != EINTR { throw posixError() }
+        }
+        return try action()
+    }
+
+    private static func stagingDirectory(in folder: URL) -> URL {
+        folder.appendingPathComponent(".living-scroll-export", isDirectory: true)
+    }
+
+    private static func write(stem: String, in folder: URL, stage: URL,
+                              render: (URL, URL, URL) throws -> Void) throws -> URL {
+        let fm = FileManager.default
+        try fm.createDirectory(at: stage, withIntermediateDirectories: false,
+                               attributes: [.posixPermissions: 0o700])
+        var prepared = false
+        defer {
+            // After marking the staged set ready, retain any unpublished products for retry.
+            if !prepared { try? fm.removeItem(at: stage) }
+        }
+        try Data().write(to: stage.appendingPathComponent(owner))
+        let png = stage.appendingPathComponent("output.png")
+        let pdf = stage.appendingPathComponent("output.pdf")
+        let json = stage.appendingPathComponent("output.json")
+        try render(png, pdf, json)
+        try validateDestinations(stem: stem, folder: folder)
+        try Data().write(to: stage.appendingPathComponent(stem + ".ready"))
+        prepared = true
+        try publish(stage: stage, stem: stem, folder: folder)
+        try fm.removeItem(at: stage)
+        return folder.appendingPathComponent(stem + ".pdf")
+    }
+
+    private static func recover(stage: URL, in folder: URL) throws {
+        guard let state = try attributes(of: stage) else { return }
+        guard state.st_mode & S_IFMT == S_IFDIR else { throw Exporter.ExportError.cannotCreate(stage) }
+        let fm = FileManager.default
+        let names = try fm.contentsOfDirectory(atPath: stage.path)
+        if !names.isEmpty {
+            let pending = names.filter { $0.hasSuffix(".ready") }
+            let known = Set(extensions.map { "output." + $0 } + [owner] + pending)
+            // A reserved name occupied by unrelated files must survive an export attempt.
+            guard names.contains(owner), pending.count <= 1, Set(names).isSubset(of: known) else {
+                throw Exporter.ExportError.cannotCreate(stage)
+            }
+            if let marker = pending.first {
+                let stem = String(marker.dropLast(".ready".count))
+                guard !stem.isEmpty, stem != ".", stem != ".." else {
+                    throw Exporter.ExportError.cannotCreate(stage)
+                }
+                try validateDestinations(stem: stem, folder: folder)
+                try publish(stage: stage, stem: stem, folder: folder)
+            }
+        }
+        // An interrupted encoder has no ready marker and has never touched public files.
+        try fm.removeItem(at: stage)
+    }
+
+    private static func validateDestinations(stem: String, folder: URL) throws {
+        for ext in extensions {
+            let url = folder.appendingPathComponent(stem + "." + ext)
+            guard let state = try attributes(of: url) else { continue }
+            let locked = UInt32(UF_IMMUTABLE | UF_APPEND | SF_IMMUTABLE | SF_APPEND)
+            guard state.st_mode & S_IFMT == S_IFREG, state.st_flags & locked == 0 else {
+                throw Exporter.ExportError.cannotCreate(url)
+            }
+        }
+    }
+
+    private static func publish(stage: URL, stem: String, folder: URL) throws {
+        for ext in extensions {
+            let source = stage.appendingPathComponent("output." + ext)
+            let target = folder.appendingPathComponent(stem + "." + ext)
+            if let state = try attributes(of: source) {
+                guard state.st_mode & S_IFMT == S_IFREG else { throw Exporter.ExportError.cannotCreate(source) }
+                guard Darwin.rename(source.path, target.path) == 0 else { throw posixError() }
+            } else if try attributes(of: target) == nil {
+                throw Exporter.ExportError.cannotCreate(target)
+            }
+        }
+    }
+
+    private static func attributes(of url: URL) throws -> stat? {
+        var state = stat()
+        if lstat(url.path, &state) == 0 { return state }
+        if errno == ENOENT { return nil }
+        throw posixError()
+    }
+
+    private static func posixError() -> POSIXError {
+        POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
 }
