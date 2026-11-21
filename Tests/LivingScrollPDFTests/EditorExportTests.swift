@@ -60,12 +60,14 @@ final class EditorExportTests: XCTestCase {
             source.fill(full)
             let input = folder.appendingPathComponent("source-\(bits).png")
             try Exporter.writePNG(XCTUnwrap(source.makeImage()), to: input)
+            let inputBytes = try Data(contentsOf: input)
             let item = try library.load(library.importPNG(at: input))
             var doc = item.document
             doc.layers = [EditLayer(kind: .mosaic, rect: CGRect(x: 12, y: 3, width: 20, height: 18))]
             let pdf = try EditorExport.write(doc, original: item.original, folder: folder)
             let png = pdf.deletingPathExtension().appendingPathExtension("png")
-            XCTAssertEqual(png, input)
+            XCTAssertEqual(png.lastPathComponent, "source-\(bits)-2.png")
+            XCTAssertEqual(try Data(contentsOf: input), inputBytes)
             let dst = try XCTUnwrap(CGImageSourceCreateWithURL(png as CFURL, nil))
             let result = try XCTUnwrap(CGImageSourceCreateImageAtIndex(dst, 0, nil))
             XCTAssertEqual(result.bitsPerComponent, bits)
@@ -134,6 +136,14 @@ final class EditorExportTests: XCTestCase {
         XCTAssertEqual(saved.gaps, record.gaps)
         XCTAssertEqual(saved.pngSHA256, try Exporter.sha256(of: png))
         XCTAssertEqual(saved.pdfSHA256, try Exporter.sha256(of: pdf))
+        let privatePNG = try library.originalURL(for: doc.id)
+        let sidecar = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: privatePNG.deletingLastPathComponent(),
+                                                                             includingPropertiesForKeys: nil)
+            .first { $0.lastPathComponent.hasSuffix(".edit.json") })
+        let modes = try [png, pdf, base.appendingPathExtension("json"), privatePNG, sidecar].map {
+            try FileManager.default.attributesOfItem(atPath: $0.path)[.posixPermissions] as? Int
+        }
+        XCTAssertEqual(modes, [0o644, 0o644, 0o644, 0o600, 0o600])
         let duplicate = try EditorExport.write(doc, original: original, folder: folder)
         XCTAssertEqual(duplicate, pdf)
         let resumed = try library.load(library.importPNG(at: png))
@@ -210,7 +220,7 @@ final class EditorExportTests: XCTestCase {
         XCTAssertEqual(try string("CreationDate"), "D:19700101000200Z")
     }
 
-    func testBadFinalDestinationLeavesEarlierProductsIntact() throws {
+    func testUnusableOrMissingSidecarLeavesEarlierProductsIntact() throws {
         let fm = FileManager.default
         let folder = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? fm.removeItem(at: folder) }
@@ -223,13 +233,85 @@ final class EditorExportTests: XCTestCase {
         try fm.removeItem(at: json)
         try fm.createDirectory(at: json, withIntermediateDirectories: false)
         doc.layers = [EditLayer(kind: .mosaic, rect: CGRect(x: 0, y: 0, width: 64, height: 64))]
-        XCTAssertThrowsError(try EditorExport.write(doc, original: image, folder: folder))
+        let alternate = try EditorExport.write(doc, original: image, folder: folder)
+        XCTAssertEqual(alternate.lastPathComponent, "kept-2.pdf")
         XCTAssertEqual(try Data(contentsOf: png), oldPNG)
         XCTAssertEqual(try Data(contentsOf: pdf), oldPDF)
-        XCTAssertEqual(try Set(fm.contentsOfDirectory(atPath: folder.path)), Set(["kept.png", "kept.pdf", "kept.json"]))
+        XCTAssertEqual(try fm.attributesOfItem(atPath: json.path)[.type] as? FileAttributeType, .typeDirectory)
         try fm.removeItem(at: json)
+        XCTAssertEqual(try EditorExport.write(doc, original: image, folder: folder), alternate)
+        XCTAssertFalse(fm.fileExists(atPath: json.path))
+        XCTAssertEqual(try readRecord(alternate.deletingPathExtension().appendingPathExtension("json")).editLayerCount, 1)
+    }
+
+    func testDifferentProjectsWithTheSameNameKeepBothExportSets() throws {
+        let fm = FileManager.default
+        let folder = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: folder) }
+        let image = try stripedOriginal()
+        let a = EditDocument(name: "Chats", record: fixtureRecord())
+        var b = EditDocument(name: a.name, record: fixtureRecord())
+        let first = try EditorExport.write(a, original: image, folder: folder)
+        let originals = ["png", "pdf", "json"].map { first.deletingPathExtension().appendingPathExtension($0) }
+        let bytes = try originals.map { try Data(contentsOf: $0) }
+        let second = try EditorExport.write(b, original: image, folder: folder)
+        XCTAssertEqual(second.lastPathComponent, "Chats-2.pdf")
+        b.layers = [EditLayer(kind: .mosaic, rect: CGRect(x: 0, y: 0, width: 64, height: 64))]
+        XCTAssertEqual(try EditorExport.write(b, original: image, folder: folder), second)
+        let updated = try readRecord(second.deletingPathExtension().appendingPathExtension("json"))
+        XCTAssertEqual(updated.editingProjectID, b.id)
+        XCTAssertEqual(updated.editLayerCount, 1)
+        XCTAssertEqual(try originals.map { try Data(contentsOf: $0) }, bytes)
+        XCTAssertEqual(try readRecord(originals[2]).editingProjectID, a.id)
+    }
+
+    func testPersonalPDFAndInvalidRecordReserveTheirNames() throws {
+        let fm = FileManager.default
+        let folder = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: folder) }
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let personal = folder.appendingPathComponent("Report.pdf")
+        let invalid = folder.appendingPathComponent("Report-2.json")
+        try Data("my PDF".utf8).write(to: personal)
+        try Data("unreadable record".utf8).write(to: invalid)
+        let image = try stripedOriginal()
+        let doc = EditDocument(name: "Report", record: fixtureRecord())
+        let pdf = try EditorExport.write(doc, original: image, folder: folder)
+        XCTAssertEqual(pdf.lastPathComponent, "Report-3.pdf")
+        XCTAssertEqual(try Data(contentsOf: personal), Data("my PDF".utf8))
+        XCTAssertEqual(try Data(contentsOf: invalid), Data("unreadable record".utf8))
+        // Removing an earlier collision must not strand a project's previous export.
+        try fm.removeItem(at: personal)
         XCTAssertEqual(try EditorExport.write(doc, original: image, folder: folder), pdf)
-        XCTAssertEqual(try readRecord(json).editLayerCount, 1)
+    }
+
+    func testExportWithoutAProjectIDDoesNotClaimAnotherUnidentifiedExport() throws {
+        let fm = FileManager.default
+        let folder = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: folder) }
+        let image = try stripedOriginal(), record = fixtureRecord()
+        let initial = try Exporter.export(image, record: record, folder: folder, name: "Legacy")
+        let json = initial.deletingPathExtension().appendingPathExtension("json")
+        let bytes = try Data(contentsOf: json)
+        XCTAssertNil(try readRecord(json).editingProjectID)
+        let next = try Exporter.export(image, record: record, folder: folder, name: "Legacy")
+        XCTAssertEqual(next.lastPathComponent, "Legacy-2.pdf")
+        let doc = EditDocument(name: "Legacy", record: record)
+        XCTAssertEqual(try EditorExport.write(doc, original: image, folder: folder).lastPathComponent, "Legacy-3.pdf")
+        XCTAssertEqual(try Data(contentsOf: json), bytes)
+    }
+
+    func testManuallyReplacedPDFIsProtectedEvenWithItsOldProjectRecord() throws {
+        let fm = FileManager.default
+        let folder = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: folder) }
+        let image = try stripedOriginal()
+        let doc = EditDocument(name: "Notes", record: fixtureRecord())
+        let pdf = try EditorExport.write(doc, original: image, folder: folder)
+        let personal = Data("hand-edited PDF".utf8)
+        try personal.write(to: pdf)
+        XCTAssertEqual(try EditorExport.write(doc, original: image, folder: folder).lastPathComponent, "Notes-2.pdf")
+        XCTAssertEqual(try Data(contentsOf: pdf), personal)
     }
 
     func testConcurrentSameNameExportsPublishOneMatchingGeneration() async throws {
@@ -239,7 +321,8 @@ final class EditorExportTests: XCTestCase {
         let image = try stripedOriginal()
         let mask = EditLayer(kind: .mosaic, rect: CGRect(x: 0, y: 0, width: 64, height: 64))
         let plain = EditDocument(name: "shared", record: fixtureRecord())
-        let redacted = EditDocument(name: "shared", record: fixtureRecord(), layers: [mask])
+        var redacted = plain
+        redacted.layers = [mask]
         let pdf = folder.appendingPathComponent("shared.pdf")
         try await withThrowingTaskGroup(of: URL.self) { group in
             for doc in [plain, redacted, plain, redacted] {
@@ -248,11 +331,26 @@ final class EditorExportTests: XCTestCase {
             for try await url in group { XCTAssertEqual(url, pdf) }
         }
         let result = try readRecord(folder.appendingPathComponent("shared.json"))
-        XCTAssertTrue(result.editingProjectID == plain.id || result.editingProjectID == redacted.id)
-        XCTAssertEqual(result.editLayerCount, result.editingProjectID == plain.id ? 0 : 1)
+        XCTAssertEqual(result.editingProjectID, plain.id)
+        XCTAssertTrue([0, 1].contains(try XCTUnwrap(result.editLayerCount)))
         XCTAssertEqual(result.pngSHA256, try Exporter.sha256(of: folder.appendingPathComponent("shared.png")))
         XCTAssertEqual(result.pdfSHA256, try Exporter.sha256(of: pdf))
         XCTAssertEqual(try Set(fm.contentsOfDirectory(atPath: folder.path)), Set(["shared.pdf", "shared.png", "shared.json"]))
+    }
+
+    private func stageAfterPublishingPNG(from pdf: URL, in folder: URL) throws -> URL {
+        let fm = FileManager.default
+        let base = pdf.deletingPathExtension()
+        let stage = folder.appendingPathComponent(".living-scroll-export")
+        try fm.createDirectory(at: stage, withIntermediateDirectories: true)
+        try Data().write(to: stage.appendingPathComponent(".living-scroll-publication-v1"))
+        try Data().write(to: stage.appendingPathComponent(base.lastPathComponent + ".ready"))
+        for ext in ["pdf", "json"] {
+            try fm.copyItem(at: base.appendingPathExtension(ext), to: stage.appendingPathComponent("output." + ext))
+        }
+        let png = folder.appendingPathComponent(base.lastPathComponent + ".png")
+        try Data(contentsOf: base.appendingPathExtension("png")).write(to: png, options: .atomic)
+        return stage
     }
 
     func testStartupRecoveryFinishesAnInterruptedReplacement() throws {
@@ -264,24 +362,113 @@ final class EditorExportTests: XCTestCase {
         var doc = EditDocument(name: "capture", record: fixtureRecord())
         _ = try EditorExport.write(doc, original: image, folder: folder)
         doc.layers = [EditLayer(kind: .mosaic, rect: CGRect(x: 0, y: 0, width: 64, height: 64))]
-        _ = try EditorExport.write(doc, original: image, folder: other)
+        let completed = try EditorExport.write(doc, original: image, folder: other)
         // Model interruption after the first atomic rename; PDF and JSON are still staged.
-        let stage = folder.appendingPathComponent(".living-scroll-export")
-        try fm.createDirectory(at: stage, withIntermediateDirectories: false)
-        try Data().write(to: stage.appendingPathComponent(".living-scroll-publication-v1"))
-        try Data().write(to: stage.appendingPathComponent("capture.ready"))
-        for ext in ["pdf", "json"] {
-            try fm.copyItem(at: other.appendingPathComponent("capture." + ext), to: stage.appendingPathComponent("output." + ext))
-        }
+        let stage = try stageAfterPublishingPNG(from: completed, in: folder)
         let png = folder.appendingPathComponent("capture.png")
-        try fm.removeItem(at: png)
-        try fm.copyItem(at: other.appendingPathComponent("capture.png"), to: png)
+        // A v1 stage may already have moved one 0600 product before the app quit.
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: png.path)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stage.appendingPathComponent("output.pdf").path)
         try Exporter.recoverPendingExport(in: folder)
         try Exporter.recoverPendingExport(in: folder)
         let result = try readRecord(folder.appendingPathComponent("capture.json"))
         XCTAssertEqual(result.editLayerCount, 1)
         XCTAssertEqual(result.pngSHA256, try Exporter.sha256(of: png))
-        XCTAssertEqual(result.pdfSHA256, try Exporter.sha256(of: folder.appendingPathComponent("capture.pdf")))
+        let pdf = folder.appendingPathComponent("capture.pdf")
+        XCTAssertEqual(result.pdfSHA256, try Exporter.sha256(of: pdf))
+        for file in [png, pdf] {
+            XCTAssertEqual(try fm.attributesOfItem(atPath: file.path)[.posixPermissions] as? Int, 0o644)
+        }
         XCTAssertFalse(fm.fileExists(atPath: stage.path))
+    }
+
+    func testStartupRecoveryKeepsAPersonalPDFArrivingAfterTheFirstRename() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: root) }
+        let folder = root.appendingPathComponent("public")
+        let doc = EditDocument(name: "capture", record: fixtureRecord())
+        let original = try stripedOriginal()
+        let other = root.appendingPathComponent("completed")
+        try fm.createDirectory(at: other, withIntermediateDirectories: true)
+        try Data("existing".utf8).write(to: other.appendingPathComponent("capture.pdf"))
+        let completed = try EditorExport.write(doc, original: original, folder: other)
+        XCTAssertEqual(completed.lastPathComponent, "capture-2.pdf")
+        let stage = try stageAfterPublishingPNG(from: completed, in: folder)
+        try Data(doc.name.utf8).write(to: stage.appendingPathComponent("capture-2.ready"))
+        try Data("existing".utf8).write(to: folder.appendingPathComponent("capture.pdf"))
+        let personal = folder.appendingPathComponent("capture-2.pdf")
+        let contents = Data("personal PDF added while the app was closed".utf8)
+        try contents.write(to: personal)
+        try Exporter.recoverPendingExport(in: folder)
+        let recovered = folder.appendingPathComponent("capture-3")
+        let record = try readRecord(recovered.appendingPathExtension("json"))
+        XCTAssertEqual(record.editingProjectID, doc.id)
+        XCTAssertEqual(record.pngSHA256, try Exporter.sha256(of: recovered.appendingPathExtension("png")))
+        XCTAssertEqual(record.pdfSHA256, try Exporter.sha256(of: recovered.appendingPathExtension("pdf")))
+        XCTAssertEqual(try Data(contentsOf: personal), contents)
+        XCTAssertFalse(fm.fileExists(atPath: stage.path))
+        XCTAssertEqual(try EditorExport.write(doc, original: original, folder: folder), recovered.appendingPathExtension("pdf"))
+    }
+
+    func testReplacingAnAlreadyPublishedPNGDoesNotBlockFutureExports() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: root) }
+        let image = try stripedOriginal(), doc = EditDocument(name: "Capture", record: fixtureRecord())
+        let completed = try EditorExport.write(doc, original: image, folder: root.appendingPathComponent("completed"))
+        for hasPreparedCopy in [false, true] {
+            let folder = root.appendingPathComponent(hasPreparedCopy ? "current" : "v1")
+            let stage = try stageAfterPublishingPNG(from: completed, in: folder)
+            let png = folder.appendingPathComponent("Capture.png")
+            if hasPreparedCopy { try fm.copyItem(at: png, to: stage.appendingPathComponent("prepared.png")) }
+            let personal = Data("my replacement".utf8)
+            try personal.write(to: png)
+            let next = EditDocument(name: "Next", record: fixtureRecord())
+            XCTAssertEqual(try EditorExport.write(next, original: image, folder: folder).lastPathComponent, "Next.pdf")
+            XCTAssertEqual(try Data(contentsOf: png), personal)
+            XCTAssertFalse(fm.fileExists(atPath: stage.path))
+            if hasPreparedCopy {
+                let restored = folder.appendingPathComponent("Capture-2")
+                let record = try readRecord(restored.appendingPathExtension("json"))
+                XCTAssertEqual(record.editingProjectID, doc.id)
+                XCTAssertEqual(record.pngSHA256, try Exporter.sha256(of: restored.appendingPathExtension("png")))
+            } else {
+                let retained = try XCTUnwrap(fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+                    .first { $0.lastPathComponent.hasPrefix(".living-scroll-interrupted-") })
+                XCTAssertEqual(try readRecord(retained.appendingPathComponent("output.json")).editingProjectID, doc.id)
+            }
+        }
+    }
+
+    func testRestartRestoresTheActualFileDisplacedByARacingSave() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: root) }
+        let image = try stripedOriginal()
+        var doc = EditDocument(name: "Capture", record: fixtureRecord())
+        let folder = root.appendingPathComponent("public")
+        let old = try EditorExport.write(doc, original: image, folder: folder)
+        let png = old.deletingPathExtension().appendingPathExtension("png")
+        func version(_ url: URL) throws -> [String: NSNumber] {
+            var state = stat()
+            guard lstat(url.path, &state) == 0 else { throw POSIXError(.ENOENT) }
+            return ["device": NSNumber(value: state.st_dev), "inode": NSNumber(value: state.st_ino),
+                    "size": NSNumber(value: state.st_size), "modifiedSeconds": NSNumber(value: state.st_mtimespec.tv_sec),
+                    "modifiedNanoseconds": NSNumber(value: state.st_mtimespec.tv_nsec)]
+        }
+        let previous = try version(png)
+        doc.layers = [EditLayer(kind: .mosaic, rect: CGRect(x: 0, y: 0, width: 64, height: 64))]
+        let new = try EditorExport.write(doc, original: image, folder: root.appendingPathComponent("completed"))
+        let stage = try stageAfterPublishingPNG(from: new, in: folder)
+        let personal = Data("saved in Finder just before the exchange".utf8)
+        try personal.write(to: stage.appendingPathComponent("output.png"))
+        let exchange: [String: Any] = ["ext": "png", "previous": previous, "incoming": try version(png)]
+        try JSONSerialization.data(withJSONObject: exchange).write(to: stage.appendingPathComponent(".exchange.json"))
+        try Exporter.recoverPendingExport(in: folder)
+        XCTAssertEqual(try Data(contentsOf: png), personal)
+        let newPNG = folder.appendingPathComponent("Capture-2.png")
+        XCTAssertEqual(try Exporter.sha256(of: newPNG), try Exporter.sha256(of: new.deletingPathExtension().appendingPathExtension("png")))
+        XCTAssertEqual(try readRecord(newPNG.deletingPathExtension().appendingPathExtension("json")).editingProjectID, doc.id)
     }
 }

@@ -105,7 +105,12 @@ final class ScrollLibrary {
         let temporary = url.deletingLastPathComponent().appendingPathComponent(".write-" + UUID().uuidString + ".tmp")
         defer { try? fm.removeItem(at: temporary) }
         try data.write(to: temporary)
-        try renameItem(temporary, to: url)
+        try publishPrivateFile(temporary, to: url)
+    }
+
+    private func publishPrivateFile(_ staged: URL, to file: URL) throws {
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: staged.path)
+        try renameItem(staged, to: file)
     }
 
     private func writeIndex(_ index: Index) throws {
@@ -279,10 +284,37 @@ final class ScrollLibrary {
                     catch { migrationError = migrationError ?? error }
                 }
             } catch { migrationError = migrationError ?? error }
+            // Earlier versions could import an original with its public file mode.
+            for entry in index.entries {
+                do { try restrictExistingProjectFiles(entry) }
+                catch LibraryError.invalidLocation { continue } // Only visit verified private directories.
+                catch { migrationError = migrationError ?? error }
+            }
         }
         storageReady = true
         migrationComplete = migrationError == nil
         if reportMigrationError, let migrationError { throw LibraryError.migrationPending(migrationError) }
+    }
+
+    private func restrictExistingProjectFiles(_ entry: ScrollEntry) throws {
+        try checkProjectFolder(entry)
+        let directory = project(entry)
+        for url in try children(directory) where url.lastPathComponent == "original.png" || url.lastPathComponent.hasSuffix(".edit.json") {
+            let attributes = try fm.attributesOfItem(atPath: url.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular,
+                  attributes[.posixPermissions] as? Int != 0o600 else { continue }
+            if (attributes[.referenceCount] as? Int ?? 1) > 1 {
+                // A migrated hard link must not change the mode of someone's public copy.
+                let copy = directory.appendingPathComponent(".mode-" + UUID().uuidString)
+                defer { try? fm.removeItem(at: copy) }
+                try fm.copyItem(at: url, to: copy)
+                try publishPrivateFile(copy, to: url)
+            } else {
+                guard fchmodat(AT_FDCWD, url.path, 0o600, AT_SYMLINK_NOFOLLOW) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+            }
+        }
     }
 
     private func finishMigration(_ id: UUID, into index: inout Index) throws {
@@ -391,7 +423,7 @@ final class ScrollLibrary {
             let staged = folder.appendingPathComponent(".original.pending")
             if collection == nil, try type(of: original) == nil, try type(of: staged) == .typeRegular {
                 // A process can stop either inside the encoder or just before rename.
-                if try completePNG(at: staged) { try renameItem(staged, to: original) }
+                if try completePNG(at: staged) { try publishPrivateFile(staged, to: original) }
                 else { try fm.removeItem(at: staged) }
             }
             guard try type(of: original) == .typeRegular, try completePNG(at: original),
@@ -650,7 +682,7 @@ final class ScrollLibrary {
                 } else {
                     try Exporter.writePNG(original, to: staged)
                 }
-                try renameItem(staged, to: source)
+                try publishPrivateFile(staged, to: source)
             } else if try type(of: source) != .typeRegular {
                 throw LibraryError.originalGone
             }

@@ -187,6 +187,11 @@ final class ScrollLibraryTests: XCTestCase {
         let privateStore = ScrollLibrary(outputFolder: output, root: support, legacyOutputFolders: [])
         let source = try image(0.4)
         let existing = try privateStore.save(EditDocument(name: "Earlier", record: record()), original: source, categoryID: nil)
+        let existingPNG = try privateStore.originalURL(for: existing.id)
+        let existingSidecar = existingPNG.deletingLastPathComponent().appendingPathComponent(try XCTUnwrap(existing.revision).uuidString + ".edit.json")
+        let linkedCopy = destination.appendingPathComponent("shared.png")
+        try fm.linkItem(at: existingPNG, to: linkedCopy)
+        for url in [existingPNG, existingSidecar] { try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path) }
         var doc = EditDocument(name: "Meeting", record: record(), layers: [
             EditLayer(kind: .mosaic, rect: CGRect(x: 0, y: 4, width: 20, height: 14))
         ], revision: UUID())
@@ -202,6 +207,12 @@ final class ScrollLibraryTests: XCTestCase {
         }
         let migrated = launch()
         try migrated.prepare()
+        let importedPNG = try migrated.originalURL(for: doc.id)
+        let importedSidecar = importedPNG.deletingLastPathComponent().appendingPathComponent(try XCTUnwrap(doc.revision).uuidString + ".edit.json")
+        for url in [existingPNG, existingSidecar, importedPNG, importedSidecar] {
+            XCTAssertEqual(try fm.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int, 0o600)
+        }
+        XCTAssertEqual(try fm.attributesOfItem(atPath: linkedCopy.path)[.posixPermissions] as? Int, 0o644)
         XCTAssertFalse(fm.fileExists(atPath: legacy.directory.path))
         XCTAssertFalse(fm.fileExists(atPath: other.directory.path))
         XCTAssertEqual(try fm.contentsOfDirectory(atPath: output.path), ["Meeting.pdf"])

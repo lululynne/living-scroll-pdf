@@ -97,7 +97,7 @@ private enum RasterError: LocalizedError {
 }
 
 private func outputFile(_ url: URL) throws -> FileHandle {
-    let fd = Darwin.open(url.path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o600)
+    let fd = Darwin.open(url.path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o644)
     guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
 }

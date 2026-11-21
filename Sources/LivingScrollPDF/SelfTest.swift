@@ -831,7 +831,7 @@ enum SelfTest {
         do {
             let rec = CaptureRecord(appName: "SelfTest", windowTitle: "synthetic", startedAt: Date(), endedAt: Date(),
                                     framesStitched: s.acceptedFrames, droppedFrames: s.lostFrames, pixelWidth: img.width,
-                                    pixelHeight: img.height, pointScale: 2)
+                                    pixelHeight: img.height, pointScale: 2, editingProjectID: UUID())
             let pdf = try Exporter.export(img, record: rec, folder: dir, layout: .long)
             let pages = CGPDFDocument(pdf as CFURL)?.numberOfPages ?? 0
             check("long pdf is one page", pages == 1, "pages=\(pages)")
@@ -840,7 +840,7 @@ enum SelfTest {
             let a4Record = try JSONSerialization.jsonObject(with: Data(contentsOf: a4.deletingPathExtension().appendingPathExtension("json"))) as? [String: Any]
             check("a4 pdf paginated", a4Pages > 1 && a4Record?["pdfPages"] as? Int == a4Pages, "pages=\(a4Pages)")
             let again = try Exporter.export(img, record: rec, folder: dir, layout: .long)
-            check("same name replaces the existing export", again == pdf, again.lastPathComponent)
+            check("the same project replaces its previous export", again == pdf, again.lastPathComponent)
             var partial = rec
             partial.isPartial = true; partial.partialReason = "ended-before-reconnecting"
             let partialPDF = try Exporter.export(img, record: partial, folder: dir)

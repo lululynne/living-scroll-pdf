@@ -124,9 +124,12 @@ enum Exporter {
 
     /// Encode all of the new products before replacing any public file.
     static func export(_ image: CGImage, record: CaptureRecord, folder: URL = outputFolder,
-                       name: String? = nil, layers: [EditLayer] = [], layout: PDFLayout = pdfLayout) throws -> URL {
+                       name: String? = nil, layers: [EditLayer] = [], layout: PDFLayout = pdfLayout,
+                       legacyFolders: [URL] = []) throws -> URL {
         let stem = fileStem(for: record, name: name)
-        return try ExportPublication.write(in: folder, stem: stem) { png, pdf, json in
+        let destination = ExportPublication.previousFolder(for: record.editingProjectID, stem: stem,
+                                                          preferred: folder, legacyFolders: legacyFolders)
+        return try ExportPublication.write(in: destination, stem: stem, projectID: record.editingProjectID) { png, pdf, json in
             let pages = try BandedExport.write(original: image, layers: layers, record: record,
                                                layout: layout, png: png, pdf: pdf)
             var published = record
@@ -192,10 +195,12 @@ enum Exporter {
 
     enum ExportError: LocalizedError, CustomStringConvertible {
         case cannotCreate(URL)
+        case interrupted(URL)
         var errorDescription: String? { description }
         var description: String {
             switch self {
             case .cannotCreate(let url): return L("无法写入 \(url.path)", "Could not write \(url.path)")
+            case .interrupted(let url): return L("中断导出的剩余文件保存在 \(url.path)", "The remaining files from the interrupted export are in \(url.path)")
             }
         }
     }
@@ -207,15 +212,70 @@ enum Exporter {
 private enum ExportPublication {
     private static let extensions = ["png", "pdf", "json"]
     private static let owner = ".living-scroll-publication-v1"
+    private static let exchange = ".exchange.json"
 
-    static func write(in folder: URL, stem: String,
+    private struct FileVersion: Codable, Equatable {
+        let device: dev_t, inode: ino_t, size: off_t
+        let modifiedSeconds: Int, modifiedNanoseconds: Int
+
+        init(_ state: stat) {
+            device = state.st_dev
+            inode = state.st_ino
+            size = state.st_size
+            modifiedSeconds = state.st_mtimespec.tv_sec
+            modifiedNanoseconds = state.st_mtimespec.tv_nsec
+        }
+    }
+
+    private struct Exchange: Codable {
+        let ext: String
+        let previous: FileVersion
+        let incoming: FileVersion
+    }
+
+    private struct Identity: Decodable {
+        let editingProjectID: UUID?
+        let pngSHA256: String
+        let pdfSHA256: String
+
+        static func read(at url: URL, state: stat?) -> Self? {
+            guard let state, state.st_mode & S_IFMT == S_IFREG,
+                  let data = try? Data(contentsOf: url) else { return nil }
+            return try? JSONDecoder().decode(Self.self, from: data)
+        }
+
+        func matches(_ url: URL) -> Bool {
+            let expected = url.pathExtension == "png" ? pngSHA256 : pdfSHA256
+            return (try? Exporter.sha256(of: url)) == expected
+        }
+    }
+
+    private struct Destination {
+        let stem: String
+        /// Only these existing files have been verified against this project's public record.
+        let replacing: [String: stat]
+    }
+
+    /// A previous app language may have selected the other Desktop folder. Only follow a
+    /// complete matching export there, including one that was assigned a numbered filename.
+    static func previousFolder(for id: UUID?, stem: String, preferred: URL, legacyFolders: [URL]) -> URL {
+        let alternatives = legacyFolders.filter { $0 != preferred }
+        guard let id, !alternatives.isEmpty else { return preferred }
+        guard let legacy = alternatives.first(where: {
+            (try? existingDestination(named: stem, in: $0, projectID: id, requireComplete: true)) != nil
+        }) else { return preferred }
+        return (try? existingDestination(named: stem, in: preferred, projectID: id)) == nil ? legacy : preferred
+    }
+
+    static func write(in folder: URL, stem: String, projectID: UUID?,
                       render: (URL, URL, URL) throws -> Void) throws -> URL {
         let fm = FileManager.default
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
         return try withOutputLock(in: folder) {
             let stage = stagingDirectory(in: folder)
-            try recover(stage: stage, in: folder)
-            return try write(stem: stem, in: folder, stage: stage, render: render)
+            do { try recover(stage: stage, in: folder) }
+            catch Exporter.ExportError.interrupted { /* The incomplete v1 set has been kept separately. */ }
+            return try write(stem: stem, projectID: projectID, in: folder, stage: stage, render: render)
         }
     }
 
@@ -239,7 +299,7 @@ private enum ExportPublication {
         folder.appendingPathComponent(".living-scroll-export", isDirectory: true)
     }
 
-    private static func write(stem: String, in folder: URL, stage: URL,
+    private static func write(stem: String, projectID: UUID?, in folder: URL, stage: URL,
                               render: (URL, URL, URL) throws -> Void) throws -> URL {
         let fm = FileManager.default
         try fm.createDirectory(at: stage, withIntermediateDirectories: false,
@@ -254,12 +314,22 @@ private enum ExportPublication {
         let pdf = stage.appendingPathComponent("output.pdf")
         let json = stage.appendingPathComponent("output.json")
         try render(png, pdf, json)
-        try validateDestinations(stem: stem, folder: folder)
-        try Data().write(to: stage.appendingPathComponent(stem + ".ready"))
+        let target = try destination(named: stem, in: folder, projectID: projectID)
+        try validateDestinations(stem: target.stem, folder: folder)
+        for ext in extensions {
+            try copyProduct(stage.appendingPathComponent("output." + ext), to: stage.appendingPathComponent("prepared." + ext))
+        }
+        try Data(stem.utf8).write(to: stage.appendingPathComponent(target.stem + ".ready"))
         prepared = true
-        try publish(stage: stage, stem: stem, folder: folder)
+        let publishedStem: String
+        do {
+            try publish(stage: stage, target: target, folder: folder)
+            publishedStem = target.stem
+        } catch let error as POSIXError where error.code == .EEXIST {
+            publishedStem = try resumePublication(stem: target.stem, stage: stage, folder: folder)
+        }
         try fm.removeItem(at: stage)
-        return folder.appendingPathComponent(stem + ".pdf")
+        return folder.appendingPathComponent(publishedStem + ".pdf")
     }
 
     private static func recover(stage: URL, in folder: URL) throws {
@@ -269,7 +339,7 @@ private enum ExportPublication {
         let names = try fm.contentsOfDirectory(atPath: stage.path)
         if !names.isEmpty {
             let pending = names.filter { $0.hasSuffix(".ready") }
-            let known = Set(extensions.map { "output." + $0 } + [owner] + pending)
+            let known = Set(extensions.flatMap { ["output." + $0, "prepared." + $0] } + [owner, exchange, ".copying", ".exchange.pending"] + pending)
             // A reserved name occupied by unrelated files must survive an export attempt.
             guard names.contains(owner), pending.count <= 1, Set(names).isSubset(of: known) else {
                 throw Exporter.ExportError.cannotCreate(stage)
@@ -279,12 +349,137 @@ private enum ExportPublication {
                 guard !stem.isEmpty, stem != ".", stem != ".." else {
                     throw Exporter.ExportError.cannotCreate(stage)
                 }
-                try validateDestinations(stem: stem, folder: folder)
-                try publish(stage: stage, stem: stem, folder: folder)
+                // JSON is renamed last. A leftover marker alone means publication finished.
+                if names.contains(exchange) || extensions.contains(where: { names.contains("output." + $0) }) {
+                    _ = try resumePublication(stem: stem, stage: stage, folder: folder)
+                }
             }
         }
         // An interrupted encoder has no ready marker and has never touched public files.
         try fm.removeItem(at: stage)
+    }
+
+    private static func resumePublication(stem: String, stage: URL, folder: URL) throws -> String {
+        let journal = stage.appendingPathComponent(exchange)
+        if let state = try attributes(of: journal) {
+            guard state.st_mode & S_IFMT == S_IFREG else { throw Exporter.ExportError.cannotCreate(journal) }
+            let operation = try JSONDecoder().decode(Exchange.self, from: Data(contentsOf: journal))
+            guard extensions.contains(operation.ext) else { throw Exporter.ExportError.cannotCreate(stage) }
+            _ = try finishExchange(operation, stage: stage, stem: stem, folder: folder)
+        }
+        let marker = stage.appendingPathComponent(stem + ".ready")
+        guard let markerState = try attributes(of: marker), markerState.st_mode & S_IFMT == S_IFREG,
+              markerState.st_size <= NAME_MAX else { throw Exporter.ExportError.cannotCreate(marker) }
+        let saved = try String(contentsOf: marker, encoding: .utf8)
+        // Empty v1 markers used the requested name verbatim. New markers also remember the
+        // original stem so an interrupted "-2" can move to "-3" if its target has changed.
+        let base = saved.isEmpty ? stem : saved
+        guard stem == base || (stem.hasPrefix(base + "-") && Int(stem.dropFirst(base.count + 1)) != nil) else {
+            throw Exporter.ExportError.cannotCreate(marker)
+        }
+        let json = stage.appendingPathComponent("output.json")
+        if try attributes(of: json) == nil {
+            for ext in ["png", "pdf"] where try attributes(of: stage.appendingPathComponent("output." + ext)) != nil {
+                throw Exporter.ExportError.cannotCreate(json)
+            }
+            return stem // The last rename completed before cleanup.
+        }
+        guard let incoming = Identity.read(at: json, state: try attributes(of: json)) else {
+            throw Exporter.ExportError.cannotCreate(json)
+        }
+        var moved = Set<String>()
+        for ext in ["png", "pdf"] {
+            let source = stage.appendingPathComponent("output." + ext)
+            guard try attributes(of: source) == nil else { continue }
+            let file = folder.appendingPathComponent(stem + "." + ext)
+            if let state = try attributes(of: file), state.st_mode & S_IFMT == S_IFREG, incoming.matches(file) {
+                moved.insert(ext)
+            } else {
+                let prepared = stage.appendingPathComponent("prepared." + ext)
+                guard let copy = try attributes(of: prepared), copy.st_mode & S_IFMT == S_IFREG else {
+                    // Older writers kept no second copy after a rename.
+                    let retained = folder.appendingPathComponent(".living-scroll-interrupted-" + UUID().uuidString)
+                    try FileManager.default.moveItem(at: stage, to: retained)
+                    throw Exporter.ExportError.interrupted(retained)
+                }
+                try copyProduct(prepared, to: source)
+            }
+        }
+        let target = try matchingDestination(stem, in: folder, projectID: incoming.editingProjectID, moved: moved)
+            ?? destination(named: base, in: folder, projectID: incoming.editingProjectID)
+        try validateDestinations(stem: target.stem, folder: folder)
+        if target.stem != stem {
+            let fm = FileManager.default
+            for ext in moved {
+                let prepared = stage.appendingPathComponent("prepared." + ext)
+                let source = try attributes(of: prepared) == nil ? folder.appendingPathComponent(stem + "." + ext) : prepared
+                try copyProduct(source, to: stage.appendingPathComponent("output." + ext))
+            }
+            if saved.isEmpty { try Data(base.utf8).write(to: marker, options: .atomic) }
+            try fm.moveItem(at: marker, to: stage.appendingPathComponent(target.stem + ".ready"))
+        }
+        try publish(stage: stage, target: target, folder: folder)
+        return target.stem
+    }
+
+    private static func copyProduct(_ source: URL, to target: URL) throws {
+        // APFS clones keep the staged generation independent of edits to a newly public file.
+        if clonefile(source.path, target.path, 0) == 0 { return }
+        let fm = FileManager.default, temporary = target.deletingLastPathComponent().appendingPathComponent(".copying")
+        if try attributes(of: temporary) != nil { try fm.removeItem(at: temporary) }
+        defer { try? fm.removeItem(at: temporary) }
+        try fm.copyItem(at: source, to: temporary)
+        guard renamex_np(temporary.path, target.path, UInt32(RENAME_EXCL)) == 0 else { throw posixError() }
+    }
+
+    private static func matchingDestination(_ name: String, in folder: URL, projectID: UUID?,
+                                            moved: Set<String> = [], requireComplete: Bool = false) throws -> Destination? {
+        let json = folder.appendingPathComponent(name + ".json")
+        let jsonState = try attributes(of: json)
+        let prior = Identity.read(at: json, state: jsonState)
+        var replacing: [String: stat] = [:]
+        if let jsonState {
+            guard let projectID, prior?.editingProjectID == projectID else { return nil }
+            replacing["json"] = jsonState
+        } else if moved.isEmpty { return nil }
+        for ext in ["png", "pdf"] where !moved.contains(ext) {
+            let url = folder.appendingPathComponent(name + "." + ext)
+            if let state = try attributes(of: url) {
+                guard state.st_mode & S_IFMT == S_IFREG, prior?.matches(url) == true else { return nil }
+                replacing[ext] = state
+            } else if requireComplete { return nil }
+        }
+        return Destination(stem: name, replacing: replacing)
+    }
+
+    private static func existingDestination(named stem: String, in folder: URL, projectID: UUID?,
+                                            requireComplete: Bool = false) throws -> Destination? {
+        guard let projectID else { return nil }
+        if let base = try matchingDestination(stem, in: folder, projectID: projectID, requireComplete: requireComplete) { return base }
+        let names = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        let suffixes = names.compactMap { name -> Int? in
+            guard name.lowercased().hasSuffix(".json"),
+                  let prefix = name.range(of: stem + "-", options: [.anchored, .caseInsensitive]),
+                  let number = Int(name[prefix.upperBound...].dropLast(5)), number >= 2 else { return nil }
+            return number
+        }
+        for number in suffixes.sorted() {
+            if let existing = try matchingDestination(stem + "-\(number)", in: folder, projectID: projectID,
+                                                      requireComplete: requireComplete) { return existing }
+        }
+        return nil
+    }
+
+    private static func destination(named stem: String, in folder: URL, projectID: UUID?) throws -> Destination {
+        if let existing = try existingDestination(named: stem, in: folder, projectID: projectID) {
+            return existing
+        }
+        var name = stem, suffix = 2
+        while try extensions.contains(where: { try attributes(of: folder.appendingPathComponent(name + "." + $0)) != nil }) {
+            name = stem + "-\(suffix)"
+            suffix += 1
+        }
+        return Destination(stem: name, replacing: [:])
     }
 
     private static func validateDestinations(stem: String, folder: URL) throws {
@@ -298,17 +493,72 @@ private enum ExportPublication {
         }
     }
 
-    private static func publish(stage: URL, stem: String, folder: URL) throws {
+    private static func publish(stage: URL, target: Destination, folder: URL) throws {
         for ext in extensions {
             let source = stage.appendingPathComponent("output." + ext)
-            let target = folder.appendingPathComponent(stem + "." + ext)
-            if let state = try attributes(of: source) {
-                guard state.st_mode & S_IFMT == S_IFREG else { throw Exporter.ExportError.cannotCreate(source) }
-                guard Darwin.rename(source.path, target.path) == 0 else { throw posixError() }
-            } else if try attributes(of: target) == nil {
-                throw Exporter.ExportError.cannotCreate(target)
+            let file = folder.appendingPathComponent(target.stem + "." + ext)
+            let staged = try attributes(of: source)
+            let product = staged == nil ? file : source
+            guard let state = try staged ?? attributes(of: file), state.st_mode & S_IFMT == S_IFREG else {
+                throw Exporter.ExportError.cannotCreate(product)
+            }
+            if state.st_mode & 0o7777 != 0o644 {
+                guard fchmodat(AT_FDCWD, product.path, 0o644, AT_SYMLINK_NOFOLLOW) == 0 else { throw posixError() }
+            }
+            guard staged != nil else { continue }
+            if let checked = target.replacing[ext], let current = try attributes(of: file) {
+                guard current.st_dev == checked.st_dev, current.st_ino == checked.st_ino,
+                      current.st_ctimespec.tv_sec == checked.st_ctimespec.tv_sec,
+                      current.st_ctimespec.tv_nsec == checked.st_ctimespec.tv_nsec else { throw POSIXError(.EEXIST) }
+                let operation = Exchange(ext: ext, previous: FileVersion(checked), incoming: FileVersion(state))
+                let journal = stage.appendingPathComponent(exchange)
+                let pending = stage.appendingPathComponent(".exchange.pending")
+                try JSONEncoder().encode(operation).write(to: pending)
+                guard renamex_np(pending.path, journal.path, UInt32(RENAME_EXCL)) == 0 else { throw posixError() }
+                guard renamex_np(source.path, file.path, UInt32(RENAME_SWAP)) == 0 else {
+                    let error = posixError()
+                    try FileManager.default.removeItem(at: journal)
+                    throw error.code == .ENOENT ? POSIXError(.EEXIST) : error
+                }
+                guard try finishExchange(operation, stage: stage, stem: target.stem, folder: folder) else { throw POSIXError(.EEXIST) }
+            } else {
+                guard renamex_np(source.path, file.path, UInt32(RENAME_EXCL)) == 0 else { throw posixError() }
             }
         }
+    }
+
+    /// Swap keeps the displaced inode until it can be checked. An ordinary replacing
+    /// rename would unlink a Finder save that raced the final lstat.
+    private static func finishExchange(_ operation: Exchange, stage: URL, stem: String, folder: URL) throws -> Bool {
+        let fm = FileManager.default
+        let source = stage.appendingPathComponent("output." + operation.ext)
+        let file = folder.appendingPathComponent(stem + "." + operation.ext)
+        let displaced = try attributes(of: source).map(FileVersion.init)
+        var finished = displaced == nil
+        if displaced == nil, try attributes(of: file).map(FileVersion.init) != operation.incoming {
+            try copyProduct(stage.appendingPathComponent("prepared." + operation.ext), to: source)
+            finished = false
+        } else if displaced == operation.previous {
+            try fm.removeItem(at: source)
+            finished = true
+        } else if let displaced, displaced != operation.incoming {
+            let publicFile = try attributes(of: file).map(FileVersion.init)
+            if publicFile == operation.incoming {
+                guard renamex_np(source.path, file.path, UInt32(RENAME_SWAP)) == 0 else { throw posixError() }
+            } else if publicFile == nil {
+                guard renamex_np(source.path, file.path, UInt32(RENAME_EXCL)) == 0 else { throw posixError() }
+            }
+            if let remaining = try attributes(of: source), FileVersion(remaining) != operation.incoming {
+                // A second independent save also won the name. Keep both personal files.
+                let kept = folder.appendingPathComponent("Recovered-" + UUID().uuidString + "." + operation.ext)
+                try fm.moveItem(at: source, to: kept)
+            }
+            if try attributes(of: source) == nil {
+                try copyProduct(stage.appendingPathComponent("prepared." + operation.ext), to: source)
+            }
+        }
+        try fm.removeItem(at: stage.appendingPathComponent(exchange))
+        return finished
     }
 
     private static func attributes(of url: URL) throws -> stat? {

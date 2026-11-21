@@ -708,28 +708,7 @@ enum EditorExport {
         var record = document.record
         record.editingProjectID = document.id
         record.editLayerCount = document.layers.count
-        let stem = Exporter.fileStem(for: record, name: document.name)
-        let destination = previousOutput(for: document.id, stem: stem, preferred: folder, legacyFolders: legacyFolders)
-        return try Exporter.export(original, record: record, folder: destination, name: document.name, layers: document.layers)
-    }
-
-    /// v0.3 could save one private project but export it in the other interface language's
-    /// folder. Only select that older destination when both public files still match its record.
-    private static func previousOutput(for id: UUID, stem: String, preferred: URL, legacyFolders: [URL]) -> URL {
-        let alternatives = legacyFolders.filter { $0 != preferred }
-        guard !alternatives.isEmpty else { return preferred }
-        struct Identity: Decodable { let editingProjectID: UUID; let pngSHA256: String; let pdfSHA256: String }
-        func identity(in folder: URL) -> Identity? {
-            let url = folder.appendingPathComponent(stem + ".json")
-            guard let data = try? Data(contentsOf: url), let identity = try? JSONDecoder().decode(Identity.self, from: data),
-                  identity.editingProjectID == id else { return nil }
-            return identity
-        }
-        if identity(in: preferred) != nil { return preferred }
-        return alternatives.first { folder in
-            guard let prior = identity(in: folder) else { return false }
-            return (try? Exporter.sha256(of: folder.appendingPathComponent(stem + ".png"))) == prior.pngSHA256
-                && (try? Exporter.sha256(of: folder.appendingPathComponent(stem + ".pdf"))) == prior.pdfSHA256
-        } ?? preferred
+        return try Exporter.export(original, record: record, folder: folder, name: document.name,
+                                   layers: document.layers, legacyFolders: legacyFolders)
     }
 }
