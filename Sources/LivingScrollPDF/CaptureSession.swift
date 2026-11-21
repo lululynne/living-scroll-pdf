@@ -487,14 +487,14 @@ final class CaptureSession {
         autoScroll = false
         timer?.invalidate()
         hud.setBusy()
-        update(L("正在生成 PDF…", "Saving PDF…"))
+        update(EditorCopy.preparing)
         let stitcher = self.stitcher
         let base = CaptureRecord(appName: pick.appName, windowTitle: pick.windowTitle, startedAt: startedAt,
                                  endedAt: Date(), framesStitched: 0, droppedFrames: 0, pixelWidth: 0,
                                  pixelHeight: 0, pointScale: scale)
         Task { @MainActor in
             while inFlight { try? await Task.sleep(nanoseconds: 30_000_000) }
-            let result: Result<URL, Error>? = await withCheckedContinuation { cont in
+            let captured: (CGImage, CaptureRecord)? = await withCheckedContinuation { cont in
                 work.async {
                     guard let image = stitcher.finish() else { cont.resume(returning: nil); return }
                     var rec = base
@@ -513,24 +513,25 @@ final class CaptureSession {
                     }
                     rec.pixelWidth = image.width
                     rec.pixelHeight = image.height
-                    cont.resume(returning: Result { try Exporter.export(image, record: rec) })
+                    cont.resume(returning: (image, rec))
                 }
             }
             close()
-            switch result {
-            case .success(let pdf):
-                if ProcessInfo.processInfo.environment["JZ_TEST_OWNER"] != nil {
-                    print("exported \(pdf.path)")
-                } else {
-                    NSWorkspace.shared.activateFileViewerSelecting([pdf])
-                    NSWorkspace.shared.open(pdf)
-                }
-            case .failure(let error):
-                alert(L("保存失败", "Couldn't save"), "\(error)")
-            case nil:
+            defer { end() }
+            guard let (image, record) = captured else {
                 alert(L("没有截到画面", "Nothing was captured"), L("请确认已在 系统设置 › 隐私与安全性 › 屏幕与系统录音 里打开卷轴PDF。", "Check that Living Scroll PDF is on in System Settings › Privacy & Security › Screen & System Audio Recording."))
+                return
             }
-            end()
+            if ProcessInfo.processInfo.environment["JZ_TEST_OWNER"] != nil {
+                do {
+                    let pdf = try await Task.detached { try Exporter.export(image, record: record) }.value
+                    print("exported \(pdf.path)")
+                } catch {
+                    alert(L("保存失败", "Couldn't save"), error.localizedDescription)
+                }
+            } else {
+                AppDelegate.shared?.editCapture(image, record: record)
+            }
         }
     }
 

@@ -1,12 +1,15 @@
 #!/bin/zsh
-# Builds "Living Scroll PDF.app" (signed with the local Apple Development identity, ad-hoc if none) into ./dist
+# Builds into ./dist. Pass an already-built release executable to package it directly.
 set -euo pipefail
 cd "$(dirname "$0")"
-swift build -c release
+if (( $# > 1 )); then print -u2 "usage: $0 [release-executable]"; exit 2; fi
+if (( $# == 0 )); then swift build -c release; fi
+RELEASE_BIN="${1:-.build/release/LivingScrollPDF}"
+[[ -x "$RELEASE_BIN" ]] || { print -u2 "Missing release executable: $RELEASE_BIN"; exit 1; }
 APP="dist/Living Scroll PDF.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp .build/release/LivingScrollPDF "$APP/Contents/MacOS/LivingScrollPDF"
+cp "$RELEASE_BIN" "$APP/Contents/MacOS/LivingScrollPDF"
 cp assets/AppIcon.icns assets/tip-wechat.jpg assets/contact-wechat.jpg "$APP/Contents/Resources/"
 # Chinese systems show the Chinese name in Finder, the menu bar and System Settings.
 for lang in zh-Hans zh-Hant; do
@@ -26,8 +29,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>LivingScrollPDF</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleShortVersionString</key><string>0.2.1</string>
-  <key>CFBundleVersion</key><string>8</string>
+  <key>CFBundleShortVersionString</key><string>0.3.0</string>
+  <key>CFBundleVersion</key><string>9</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>

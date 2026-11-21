@@ -24,6 +24,9 @@ struct CaptureRecord: Codable {
     var partialReason: String? = nil
     /// Where the image stops being a continuous capture. Nil, and omitted from JSON, when it does not.
     var gaps: [ContentGap]? = nil
+    /// A local library reference allows a flattened export to reopen with its original layers.
+    var editingProjectID: UUID? = nil
+    var editLayerCount: Int? = nil
 }
 
 /// A stretch that was on screen and is not in the image. `afterRow` is the image height:
@@ -74,24 +77,41 @@ enum Exporter {
             .appendingPathComponent("Desktop/" + L("卷轴PDF", "Living Scroll PDF"), isDirectory: true)
     }
 
-    /// Writes `<stem>.png`, `<stem>.pdf` and `<stem>.json` and returns the PDF URL.
-    static func export(_ image: CGImage, record: CaptureRecord, folder: URL = outputFolder) throws -> URL {
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let stamp = DateFormatter()
-        stamp.dateFormat = "yyyyMMdd-HHmmss"
-        let safeApp = record.appName.replacingOccurrences(of: "/", with: "-")
-        let base = L("卷轴PDF", "LivingScrollPDF") + "-\(safeApp)-\(stamp.string(from: record.endedAt))"
-            + (record.isPartial ? L("-未完成", "-partial") : "")
-        // Two captures ending in the same second must not overwrite each other.
-        var stem = base, n = 1
-        while ["png", "pdf", "json"].contains(where: { FileManager.default.fileExists(atPath: folder.appendingPathComponent(stem + "." + $0).path) }) {
-            n += 1
-            stem = "\(base)-\(n)"
+    static func fileStem(for record: CaptureRecord, name: String? = nil) -> String {
+        let trim = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "."))
+        var supplied = name?.trimmingCharacters(in: trim) ?? ""
+        if supplied.isEmpty {
+            let stamp = DateFormatter()
+            stamp.locale = Locale(identifier: "en_US_POSIX")
+            stamp.dateFormat = "yyyyMMdd-HHmmss"
+            supplied = L("卷轴PDF", "LivingScrollPDF") + "-\(record.appName)-\(stamp.string(from: record.endedAt))"
         }
-        let png = folder.appendingPathComponent(stem + ".png")
-        let pdf = folder.appendingPathComponent(stem + ".pdf")
-        let json = folder.appendingPathComponent(stem + ".json")
+        let unsafe = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/:\\"))
+        let cleaned = supplied.components(separatedBy: unsafe).joined(separator: "-")
+        // Leave room for a collision suffix and extension even with multibyte filenames.
+        var stem = ""
+        for character in cleaned {
+            if stem.utf8.count + String(character).utf8.count > 220 { break }
+            stem.append(character)
+        }
+        if stem.isEmpty { stem = L("长截图", "Screenshot") }
+        if record.isPartial && !stem.hasSuffix("-未完成") && !stem.lowercased().hasSuffix("-partial") {
+            stem += L("-未完成", "-partial")
+        }
+        return stem
+    }
 
+    /// Form all three files in private first. The record appears only after both
+    /// final payloads exist, and a name collision never replaces an older capture.
+    static func export(_ image: CGImage, record: CaptureRecord, folder: URL = outputFolder, name: String? = nil) throws -> URL {
+        let fm = FileManager.default
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let staging = folder.appendingPathComponent(".export-" + UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: staging, withIntermediateDirectories: false)
+        defer { try? fm.removeItem(at: staging) }
+        let png = staging.appendingPathComponent("output.png")
+        let pdf = staging.appendingPathComponent("output.pdf")
+        let json = staging.appendingPathComponent("output.json")
         try writePNG(image, to: png)
         let pages = try writePDF(image, scale: record.pointScale, layout: pdfLayout, record: record, to: pdf)
 
@@ -103,7 +123,34 @@ enum Exporter {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(rec).write(to: json)
-        return pdf
+
+        let base = fileStem(for: record, name: name)
+        var suffix = 1
+        while true {
+            let stem = suffix == 1 ? base : "\(base)-\(suffix)"
+            let sources = [png, pdf, json]
+            let destinations = sources.map { folder.appendingPathComponent(stem + "." + $0.pathExtension) }
+            suffix += 1
+            if destinations.contains(where: { fm.fileExists(atPath: $0.path) }) { continue }
+            var published: [URL] = []
+            do {
+                // Same-volume hard links reserve names without clobbering a concurrent export.
+                // copyItem also refuses replacements and works on volumes without hard links.
+                for (source, destination) in zip(sources, destinations) {
+                    do {
+                        try fm.linkItem(at: source, to: destination)
+                    } catch let error as NSError where error.code != NSFileWriteFileExistsError {
+                        try fm.copyItem(at: source, to: destination)
+                    }
+                    published.append(destination)
+                }
+                return destinations[1]
+            } catch {
+                for url in published { try? fm.removeItem(at: url) }
+                if (error as NSError).code == NSFileWriteFileExistsError { continue }
+                throw error
+            }
+        }
     }
 
     static func writePNG(_ image: CGImage, to url: URL) throws {
@@ -200,11 +247,12 @@ enum Exporter {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    enum ExportError: Error, CustomStringConvertible {
+    enum ExportError: LocalizedError, CustomStringConvertible {
         case cannotCreate(URL)
+        var errorDescription: String? { description }
         var description: String {
             switch self {
-            case .cannotCreate(let url): return "无法写入 \(url.path)"
+            case .cannotCreate(let url): return L("无法写入 \(url.path)", "Could not write \(url.path)")
             }
         }
     }

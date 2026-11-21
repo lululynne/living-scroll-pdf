@@ -9,11 +9,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var picker: WindowPicker?
     private var session: CaptureSession?
     private var hotKeyRef: EventHotKeyRef?
+    private var editors: [EditorWindow] = []
+    private var opening: Set<UUID> = []
+    private lazy var library = LibraryWindow { [weak self] id in self?.openSavedCapture(id) }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = AppDelegate.menuBarIcon()
+        installEditingMenu()
         buildMenu()
         registerHotKey()
 
@@ -51,6 +55,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let start = NSMenuItem(title: L("开始截取（⌃⌥S）", "Start Capture (⌃⌥S)"), action: #selector(startCapture), keyEquivalent: "")
             start.target = self
             menu.addItem(start)
+            let library = NSMenuItem(title: EditorCopy.library, action: #selector(showLibrary), keyEquivalent: "")
+            library.target = self
+            menu.addItem(library)
             let folder = NSMenuItem(title: L("打开输出文件夹", "Open Output Folder"), action: #selector(openFolder), keyEquivalent: "")
             folder.target = self
             menu.addItem(folder)
@@ -102,6 +109,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         TipWindow.shared?.close()
         TipWindow.shared = nil
         buildMenu()
+        installEditingMenu()
+        editors.forEach { $0.refreshLanguage() }
+    }
+
+    /// Standard responder-chain actions also work inside a filename, search field or text annotation.
+    private func installEditingMenu() {
+        let menu = NSMenu()
+        let app = NSMenuItem()
+        app.submenu = NSMenu()
+        app.submenu?.addItem(withTitle: L("退出卷轴PDF", "Quit Living Scroll PDF"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(app)
+        let edit = NSMenuItem()
+        let items = NSMenu(title: L("编辑", "Edit"))
+        items.addItem(withTitle: EditorCopy.undo, action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = items.addItem(withTitle: EditorCopy.redo, action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        items.addItem(.separator())
+        items.addItem(withTitle: L("剪切", "Cut"), action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        items.addItem(withTitle: L("复制", "Copy"), action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        items.addItem(withTitle: L("粘贴", "Paste"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        items.addItem(withTitle: L("全选", "Select All"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        edit.submenu = items
+        menu.addItem(edit)
+        NSApp.mainMenu = menu
+    }
+
+    @objc private func showLibrary() { library.present() }
+
+    func editCapture(_ image: CGImage, record: CaptureRecord) {
+        let document = EditDocument(name: Exporter.fileStem(for: record), record: record)
+        present(document, original: image, categoryID: nil, saved: false)
+    }
+
+    private func openSavedCapture(_ id: UUID) {
+        if let open = editors.first(where: { $0.documentID == id }) { open.present(); return }
+        guard opening.insert(id).inserted else { return }
+        Task {
+            defer { opening.remove(id) }
+            do {
+                let item = try await Task.detached(priority: .userInitiated) { try ScrollLibrary.shared.load(id) }.value
+                present(item.document, original: item.original, categoryID: item.categoryID, saved: true)
+            } catch {
+                let alert = NSAlert(error: error)
+                if let window = library.window { alert.beginSheetModal(for: window, completionHandler: nil) }
+                else { alert.runModal() }
+            }
+        }
+    }
+
+    private func present(_ document: EditDocument, original: CGImage, categoryID: UUID?, saved: Bool) {
+        let id = document.id
+        if let open = editors.first(where: { $0.documentID == id }) { open.present(); return }
+        let editor = EditorWindow(document: document, original: original, categoryID: categoryID, saved: saved)
+        editors.append(editor)
+        editor.onClose = { [weak self, weak editor] in self?.editors.removeAll { $0 === editor } }
+        editor.present()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard editors.contains(where: { $0.needsAttentionBeforeQuit() }) else { return .terminateNow }
+        // Let AppKit enter the pending-termination state before replying to it.
+        DispatchQueue.main.async { self.reviewBeforeQuit() }
+        return .terminateLater
+    }
+
+    private func reviewBeforeQuit() {
+        guard let editor = editors.first(where: { $0.needsAttentionBeforeQuit() }) else {
+            NSApp.reply(toApplicationShouldTerminate: true)
+            return
+        }
+        editor.present()
+        editor.reviewBeforeClosing { closed in
+            if closed { self.reviewBeforeQuit() }
+            else { NSApp.reply(toApplicationShouldTerminate: false) }
+        }
     }
 
     @objc func startCapture() {

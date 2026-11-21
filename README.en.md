@@ -22,7 +22,7 @@ Why it exists: more and more work happens inside cloud agents (web-based assista
   - a frame that does not line up is not pasted in, and content already joined is not pasted again. If one move jumps past the overlap, or two screens of text look almost the same and the program cannot prove that nothing in between was skipped, the image stays at the last join it could prove. The status bar asks you to scroll back until this screen really overlaps the previous frame; it continues only once that overlap matches, and waits where it is until then. While you scroll back with the wheel, the bar shows a signed approximate distance in screens from the break (zero is the disconnected frame; the sign flips if you go past it). Without wheel events it keeps the existing copy and does not invent a number. Finishing in that state saves a file whose name contains "partial". The JSON beside it records `isPartial`, `partialReason` and `gaps` (`afterRow` is the current image height: the gap is after the end, and no pixels are invented in the middle). Fast scrolling, or two stretches that look alike, is not automatically certified complete.
 - **Archive-friendly output:** every capture saves a long PNG and a PDF. By default the PDF is one tall page, seamless like the PNG (it only continues on a new page, at a blank row, past the 200-inch PDF page limit); under PDF Pages in the menu you can switch to A4-proportioned pages for printing, again breaking on blank rows so text isn't cut in half; a `.json` with the same name records the app, window title, start/end time, frame count, dropped-frame count, whether it is partial, and the SHA-256 of the PNG and PDF.
 
-A note on evidence: the SHA-256 shows a file is the same one produced at capture time only if you keep the hash somewhere else (send it to someone right away, put it in an email or another system). The `.json` sitting next to the files proves nothing by itself — edit the image, recompute the hash, and it matches again. Timestamps and window details are not signed either.
+A note on evidence: the hashes cover the exported PNG and PDF. The record includes the number of edit layers at export. To check later that a file matches that export, keep its hash elsewhere (send it to someone right away, put it in an email or another system). The `.json` sitting next to the files proves nothing by itself — edit the image, recompute the hash, and it matches again. Timestamps and window details are not signed either.
 
 ## Usage
 
@@ -32,7 +32,9 @@ A note on evidence: the SHA-256 shows a file is the same one produced at capture
    - hover over the window you want — it gets a blue highlight — and click to select it;
    - drag a region inside the window (framing just the chat content works best); a plain click takes the whole window; Esc goes back / cancels;
    - once the red dashed frame appears, scroll that window normally;
-   - click "Done" or press ⌃⌥S again. The PDF opens automatically; files go to `~/Desktop/Living Scroll PDF/` (`~/Desktop/卷轴PDF/` with the Chinese interface).
+   - click **Done** or press ⌃⌥S again to edit. Pinch or press ⌘+ and ⌘− to zoom, or ⌘0 to fit the width. Draw, highlight, outline, add an arrow, or drag a mosaic over a region. Click **Text** to type on the image. Insert a picture from a file or paste one.
+   - use **Select** to move a layer, double-click text to edit it, or drag a picture’s lower-right handle to resize it. Choose a filename and category, then press ⌘S to save the editable capture. Open **My Screenshots** from the menu bar to browse by category and date, search filenames or open an existing PNG.
+   - **Export PNG & PDF** flattens the annotations into both files, creates the hash record and opens the PDF. Files go to `~/Desktop/Living Scroll PDF/` (`~/Desktop/卷轴PDF/` with the Chinese interface). Share the exported PNG or PDF for a redacted copy. The library retains the full original and editable layers.
 4. "Auto-scroll to bottom" comes with the paid version; once available it additionally needs **Accessibility** permission. Before each scroll it checks that the window under the scroll point really is the target; if something covers it, auto-scroll pauses instead of scrolling the wrong window.
 
 Currently only downward scrolling is supported (capture from the start of a conversation to its end). Requires macOS 14 or later. The interface is in English or Chinese, following your system language; switch it under Language in the menu.
@@ -41,6 +43,7 @@ Currently only downward scrolling is supported (capture from the start of a conv
 
 ```sh
 swift build -c release
+swift test -c release               # editor, library and export round trips
 .build/release/LivingScrollPDF selftest   # pixel-exact self-test on a synthetic chat UI
 ./build-app.sh                     # package the .app (ad-hoc signed)
 ```
