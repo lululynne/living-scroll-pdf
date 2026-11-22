@@ -124,6 +124,10 @@ final class Stitcher: @unchecked Sendable {
     var movingShare: Double { movedBody.map { Double($0.count) / Double(max(1, prev?.height ?? 1)) } ?? 1 }
 
     private var canvas: [UInt8] = []
+    /// Previous sections and their dividers end here. Only the active section is matched or revised.
+    private(set) var segmentStart = 0
+    private var framesBeforeSegment = 0
+    var capturedRows: Int { started ? canvasRows : segmentStart + (prev?.height ?? 0) }
     private var prev: PixelFrame?
     /// Canvas row where row 0 of `prev` sits.
     private var prevOrigin = 0
@@ -160,6 +164,7 @@ final class Stitcher: @unchecked Sendable {
     private(set) var xOffset = 0
     /// Rows of the reference frame that the last non-zero placement saw move with the content.
     private var movedBody: Range<Int>?
+    private var movedColumns: Range<Int>?
     /// Next caller-clock `t` at which `locateLost` may search. A search that took `dt`
     /// seconds waits `max(0.3, 10*dt)`, measured from the caller's `t`, so a slow search
     /// stays under about a tenth of the calls and a fast one still answers at 0.3 s.
@@ -186,7 +191,7 @@ final class Stitcher: @unchecked Sendable {
     /// is searched.
     func add(_ raw: PixelFrame, expected: Int? = nil, tolerance: Int = 0) -> Outcome {
         // After the page's layout moved sideways (see `sideways`), every frame is moved back by as much.
-        let frame = xOffset == 0 || raw.width != width ? raw : raw.shiftedLeft(by: xOffset)
+        let frame = aligned(raw)
         guard let p = prev else {
             prev = frame
             width = frame.width
@@ -204,7 +209,7 @@ final class Stitcher: @unchecked Sendable {
 
         if !scrollStarted && !started {
             var unsure = false
-            if let m = findShift(p, frame, a, ambiguous: &unsure) ?? (unsure ? nil : findShiftWithChanges(p, frame, a, seam: frame.height - a.footer - max(minimumOverlap, (frame.height - a.footer - a.top) * 22 / 100), window: nil)), m.d != 0 {
+            if let m = findShift(p, frame, a, ambiguous: &unsure) ?? (unsure ? nil : findShiftWithChanges(p, frame, a, seam: frame.height - a.footer - lateWriteMargin(bodyRows: frame.height - a.footer - a.top), window: nil)), m.d != 0 {
                 scrollStarted = true // it moved, by itself or by a key: stitch from here on as usual
             } else if unsure {
                 return reject() // it may have moved, to one of several places: neither stitch nor adopt it
@@ -220,10 +225,10 @@ final class Stitcher: @unchecked Sendable {
         // scrolled up: things that float over the bottom of the content (rounded window
         // corners, "jump to latest" buttons) then appear once at the end, not at every seam.
         let bottom = frame.height - a.footer
-        let margin = max(minimumOverlap, (bottom - a.top) * 22 / 100)
+        let margin = lateWriteMargin(bodyRows: bottom - a.top)
         let window = expected.map { ($0 - tolerance)...($0 + tolerance) }
         // First canvas row not yet written, and where it falls in the reference frame.
-        let written = started ? canvasRows : bottom - margin
+        let written = started ? canvasRows : segmentStart + bottom - margin
         let seam = written - prevOrigin
 
         // The estimate can be off (the page stops at its end, rubber-bands, or the wheel was read
@@ -255,13 +260,10 @@ final class Stitcher: @unchecked Sendable {
             let band = a.top..<(frame.height - a.footer)
             // A block reaching the bottom edge may be a panel pinned over the content: never pasted in.
             let reachesBottom = band.upperBound >= frame.height - 8 * pixelScale
-            let rewrite = reachesBottom ? 0..<0 : band.lowerBound..<max(band.lowerBound, min(band.upperBound, canvasRows - prevOrigin))
+            let first = max(band.lowerBound, segmentStart - prevOrigin)
+            let rewrite = reachesBottom ? 0..<0 : first..<max(first, min(band.upperBound, canvasRows - prevOrigin))
             if !rewrite.isEmpty {
-                let stride = frame.width * 4
-                canvas.replaceSubrange(((prevOrigin + rewrite.lowerBound) * stride)..<((prevOrigin + rewrite.upperBound) * stride),
-                                       with: frame.bytes[(rewrite.lowerBound * stride)..<(rewrite.upperBound * stride)])
-                paintKnob(frame, rows: rewrite, origin: prevOrigin)
-                refreshLocateRows((prevOrigin + rewrite.lowerBound)..<(prevOrigin + rewrite.upperBound))
+                replaceRows(of: frame, rows: rewrite, origin: prevOrigin)
             }
             prev = frame
             if let f = far, f.origin == prevOrigin { far = (frame, f.origin, f.top) }
@@ -300,19 +302,15 @@ final class Stitcher: @unchecked Sendable {
         if d != 0 { learnKnob(p, frame, d: d) }
         // Nothing is written before the first frame pair has lined up.
         if !started {
-            write(p, rows: 0..<max(0, min(bottom - margin, m.cut.map { $0 + d } ?? Int.max)), origin: 0)
-            prevOrigin = 0
+            write(p, rows: 0..<max(0, min(bottom - margin, m.cut.map { $0 + d } ?? Int.max)), origin: segmentStart)
             prevTop = 0
-            far = (p, 0, 0)
+            far = (p, segmentStart, 0)
             started = true
         } else if let cut = m.cut, canvasRows > origin + cut {
             // What was written from the cut on shows the old version of the changed part: drop it. Only
             // when the new frame reaches as far as the image does, so that nothing is lost by it.
-            guard canvasRows <= origin + bottom - margin else { return reject() }
-            let keep = origin + cut
-            canvas.removeLast((canvasRows - keep) * frame.width * 4)
-            canvasRows = keep
-            shrinkLocateRows(to: keep)
+            guard origin + cut >= segmentStart, canvasRows <= origin + bottom - margin else { return reject() }
+            truncate(at: origin + cut)
             far = nil
         }
         if canvasRows < bridgeEnd {
@@ -325,7 +323,7 @@ final class Stitcher: @unchecked Sendable {
         // content behind it comes in later frames, above the panel, and the panel itself once at the end.
         let overlapEnd = min(bottom, frame.height - a.footer - d)
         let trimmed = overlapEnd - m.cleanBottom
-        let tall = trimmed > margin || (acceptedFrames >= 2 && trimmed > edgeBands.bottom + (bottom - a.top) / 10 && m.cleanBottom < bottom - margin)
+        let tall = trimmed > margin || (acceptedFrames - framesBeforeSegment >= 2 && trimmed > edgeBands.bottom + (bottom - a.top) / 10 && m.cleanBottom < bottom - margin)
         var hold = m.cleanBottom
         // The clean band was measured only within the edge allowance: find where the panel really starts.
         while tall, hold > cleanTop, m.cleanBottom - hold < 16 * pixelScale,
@@ -362,7 +360,12 @@ final class Stitcher: @unchecked Sendable {
         if d > 0, m.cut == nil {
             edgeBands = (max(edgeBands.top, m.cleanTop - a.top), max(edgeBands.bottom, bottom - (m.cleanBottom + d)))
         }
-        if d != 0 { acceptedFrames += 1; staticRun = 0; movedBody = a.top..<bottom } else { staticRun += 1 }
+        if d != 0 {
+            acceptedFrames += 1
+            staticRun = 0
+            movedBody = a.top..<bottom
+            movedColumns = a.x0..<a.x1
+        } else { staticRun += 1 }
         return .shifted(d)
     }
 
@@ -395,20 +398,35 @@ final class Stitcher: @unchecked Sendable {
     /// The frame is shifted by `xOffset` on the same condition as `add`, so a sideways
     /// re-anchor still lines the columns up.
     func locate(_ raw: PixelFrame) -> Int? {
-        let frame = xOffset == 0 || raw.width != width ? raw : raw.shiftedLeft(by: xOffset)
+        guard let distance = locatedDistance(in: aligned(raw)), distance != 0 else { return nil }
+        return distance
+    }
+
+    private func aligned(_ raw: PixelFrame) -> PixelFrame {
+        raw.width == width ? raw.shiftedLeft(by: xOffset) : raw
+    }
+
+    private func locatedDistance(in frame: PixelFrame, movingOnly: Bool = false) -> Int? {
         guard let p = prev, started, canvasRows > 0, width > 0, frame.width == width, frame.height == p.height else { return nil }
         guard canvas.count == canvasRows * width * 4 else { return nil }
         guard let span = locateColumns() else { return nil }
         let x0 = span.x0, x1 = span.x1
-        let y0 = frame.height / 5
-        let y1 = frame.height * 4 / 5
+        let body = movingOnly ? movedBody : nil
+        let columns = movingOnly ? movedColumns : nil
+        let movingLeft = max(x0, columns?.lowerBound ?? x0)
+        let movingRight = min(x1, columns?.upperBound ?? x1)
+        guard movingRight - movingLeft >= 8 else { return nil }
+        let y0 = max(frame.height / 5, body.map { $0.lowerBound + edgeBands.top } ?? 0)
+        let y1 = min(frame.height * 4 / 5, body.map { $0.upperBound - edgeBands.bottom } ?? frame.height)
         guard y1 - y0 >= 8 else { return nil }
         ensureLocateIndex()
-        guard locateHashes.count == canvasRows else { return nil }
+        guard locateHashes.count == canvasRows - segmentStart else { return nil }
 
         var all: [(fy: Int, hash: UInt64)] = []
         frame.bytes.withUnsafeBufferPointer { fb in
             for y in y0..<y1 {
+                if (movingLeft != x0 || movingRight != x1),
+                   rowSignature(fb, width: frame.width, y: y, x0: movingLeft, x1: movingRight) == nil { continue }
                 if let h = rowSignature(fb, width: frame.width, y: y, x0: x0, x1: x1) {
                     all.append((y, h))
                 }
@@ -442,7 +460,7 @@ final class Stitcher: @unchecked Sendable {
             var tried = 0, ok = 0
             for a in anchors {
                 let cy = origin + a.fy
-                guard cy >= 0, cy < canvasRows else { continue }
+                guard cy >= segmentStart, cy < canvasRows else { continue }
                 tried += 1
                 if canvasRowMatches(frame, fy: a.fy, cy: cy, x0: x0, x1: x1) { ok += 1 }
             }
@@ -456,20 +474,96 @@ final class Stitcher: @unchecked Sendable {
             if abs(other.key - best.key) <= 3 { continue }
             if verifies(other.key) { return nil }
         }
-        let d = best.key - prevOrigin
-        return d == 0 ? nil : d
+        return best.key - prevOrigin
     }
 
     /// `locate` at most once per quiet interval. Skipped calls do not search and do not
     /// move the next allowed time. The interval is `max(0.3, 10 * dt)` added to the
     /// caller's `t` (not to `t + dt`), so the 0.3 s tests still fire when the search is fast.
     func locateLost(_ frame: PixelFrame, at t: Double) -> LocateVerdict {
-        if t < nextLocateAt { return .skipped }
+        let (verdict, _) = searchLost(frame, at: t)
+        return verdict == .found(0) ? .none : verdict
+    }
+
+    private func searchLost(_ raw: PixelFrame, at t: Double, movingOnly: Bool = false) -> (LocateVerdict, PixelFrame) {
+        if t < nextLocateAt { return (.skipped, raw) }
         let t0 = DispatchTime.now().uptimeNanoseconds
-        let d = locate(frame)
+        let frame = aligned(raw)
+        var d = locatedDistance(in: frame)
+        if let distance = d, movingOnly, locatedDistance(in: frame, movingOnly: true) != distance {
+            d = nil
+        }
         let dt = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
         nextLocateAt = t + max(0.3, dt * 10)
-        return d.map { .found($0) } ?? .none
+        return (d.map { .found($0) } ?? .none, frame)
+    }
+
+    /// A unique canvas hit during recovery takes precedence over appending to the old tail.
+    /// A normal capture only pays for a search if its pair cannot be placed.
+    func addOrRejoin(_ frame: PixelFrame, expected: Int? = nil, tolerance: Int = 0,
+                     at time: Double, canCommit: () -> Bool = { true }) -> (Outcome, LocateVerdict) {
+        if needsRecovery {
+            guard canCommit() else { return (.lost, .skipped) }
+            let location = rejoinLost(frame, at: time, canCommit: canCommit)
+            if case .found = location { return (.first, location) }
+            guard location != .skipped, canCommit() else { return (.lost, .skipped) }
+            return (add(frame, expected: expected, tolerance: tolerance), location)
+        }
+        let outcome = add(frame, expected: expected, tolerance: tolerance)
+        guard outcome == .lost, canCommit() else { return (outcome, .skipped) }
+        let location = rejoinLost(frame, at: time, canCommit: canCommit)
+        if case .found = location {
+            lostFrames -= 1 // this same frame was placed after all
+            return (.first, location)
+        }
+        return (outcome, location)
+    }
+
+    /// While lost, a unique verified position in the active section can replace its stale tail.
+    /// Search and commit run together on the stitch queue, before another capture or Finish.
+    private func rejoinLost(_ raw: PixelFrame, at time: Double, canCommit: () -> Bool) -> LocateVerdict {
+        guard needsRecovery else { return .skipped }
+        let (verdict, frame) = searchLost(raw, at: time, movingOnly: true)
+        guard case .found(let distance) = verdict else { return verdict }
+        guard canCommit() else { return .skipped }
+        if distance == 0, furthest().origin == prevOrigin, prev?.bytes == frame.bytes {
+            return .none // an ordinary return to the exact tail can rejoin through add
+        }
+        let origin = prevOrigin + distance
+        let body = movedBody ?? 0..<frame.height
+        let until = body.upperBound - lateWriteMargin(bodyRows: body.count)
+        let seam = origin + until
+        guard seam >= segmentStart, origin + body.lowerBound <= canvasRows else { return .none }
+        // Anchor rows prove the position. Redraw the visible content between them as well:
+        // a lazily loaded card can change there without changing any of the anchors.
+        let first = max(body.lowerBound + edgeBands.top, segmentStart - origin)
+        let last = min(until, canvasRows - origin)
+        if first < last { replaceRows(of: frame, rows: first..<last, origin: origin) }
+        if seam < canvasRows {
+            truncate(at: seam)
+        } else {
+            extend(frame, origin: origin, top: body.lowerBound, until: until)
+        }
+        prev = frame
+        prevOrigin = origin
+        prevTop = body.lowerBound
+        far = (frame, origin, body.lowerBound)
+        knobs = knobs.filter { $0.key == ObjectIdentifier(frame) }
+        lastOverlap = nil
+        staticRun = 0
+        acceptedFrames += 1
+        markJoined()
+        return verdict
+    }
+
+    private func lateWriteMargin(bodyRows: Int) -> Int {
+        max(minimumOverlap, bodyRows * 22 / 100)
+    }
+
+    private func truncate(at row: Int) {
+        canvas.removeLast((canvasRows - row) * width * 4)
+        canvasRows = row
+        shrinkLocateRows(to: row)
     }
 
     private func locateColumns() -> (x0: Int, x1: Int)? {
@@ -494,7 +588,7 @@ final class Stitcher: @unchecked Sendable {
 
     private func ensureLocateIndex() {
         guard let span = locateColumns() else { invalidateLocateIndex(); return }
-        if !locateSpanCurrent(span) || locateHashes.count != canvasRows {
+        if !locateSpanCurrent(span) || locateHashes.count != canvasRows - segmentStart {
             rebuildLocateIndex(span)
         }
     }
@@ -506,7 +600,7 @@ final class Stitcher: @unchecked Sendable {
         locateKey = (width, pixelScale, span.x0, span.x1)
         guard canvasRows > 0, canvas.count >= canvasRows * width * 4 else { return }
         canvas.withUnsafeBufferPointer { cb in
-            for cy in 0..<canvasRows {
+            for cy in segmentStart..<canvasRows {
                 let h = rowSignature(cb, width: width, y: cy, x0: span.x0, x1: span.x1)
                 locateHashes.append(h)
                 attachLocate(h, at: cy)
@@ -518,20 +612,21 @@ final class Stitcher: @unchecked Sendable {
     private func refreshLocateRows(_ rows: Range<Int>) {
         guard !rows.isEmpty else { return }
         guard let span = locateColumns() else { invalidateLocateIndex(); return }
-        if !locateSpanCurrent(span) || locateHashes.count < rows.lowerBound {
+        if !locateSpanCurrent(span) || locateHashes.count < rows.lowerBound - segmentStart {
             rebuildLocateIndex(span)
             return
         }
         var rebuild = false
         canvas.withUnsafeBufferPointer { cb in
             for cy in rows {
-                guard cy >= 0, cy < canvasRows else { continue }
+                guard cy >= segmentStart, cy < canvasRows else { continue }
+                let i = cy - segmentStart
                 let h = rowSignature(cb, width: width, y: cy, x0: span.x0, x1: span.x1)
-                if cy < locateHashes.count {
-                    if locateHashes[cy] == h { continue }
-                    detachLocate(locateHashes[cy], at: cy)
-                    locateHashes[cy] = h
-                } else if cy == locateHashes.count {
+                if i < locateHashes.count {
+                    if locateHashes[i] == h { continue }
+                    detachLocate(locateHashes[i], at: cy)
+                    locateHashes[i] = h
+                } else if i == locateHashes.count {
                     locateHashes.append(h)
                 } else {
                     rebuild = true
@@ -544,11 +639,9 @@ final class Stitcher: @unchecked Sendable {
     }
 
     private func shrinkLocateRows(to keep: Int) {
-        guard locateHashes.count > keep else { return }
-        while locateHashes.count > keep {
-            let cy = locateHashes.count - 1
-            detachLocate(locateHashes[cy], at: cy)
-            locateHashes.removeLast()
+        while locateHashes.count > keep - segmentStart {
+            let cy = segmentStart + locateHashes.count - 1
+            detachLocate(locateHashes.removeLast(), at: cy)
         }
     }
 
@@ -657,14 +750,49 @@ final class Stitcher: @unchecked Sendable {
         }
     }
 
+    /// The first frame and the furthest frame both keep their last rows until the section ends.
+    private func writeTail() -> Bool {
+        guard prev != nil else { return false }
+        let tail = furthest()
+        return extend(tail.frame, origin: tail.origin, top: tail.top, until: tail.frame.height)
+    }
+
+    /// Only an explicit Continue Here uses this entry. No overlap with the past is implied.
+    func startNewSegment(with frame: PixelFrame, after section: Int) -> Bool {
+        guard section == segmentStart, frame.width == width, frame.height == prev?.height, writeTail() else { return false }
+        let scale = max(1, pixelScale)
+        let padding = repeatElement(UInt8.max, count: 12 * scale * width * 4)
+        canvas.append(contentsOf: padding)
+        let grayPixel: [UInt8] = [216, 216, 216, 255]
+        canvas.append(contentsOf: grayPixel.repeated(width * scale))
+        canvas.append(contentsOf: padding)
+        canvasRows += 25 * scale
+        segmentStart = canvasRows
+        framesBeforeSegment = acceptedFrames
+        acceptedFrames += 1
+        prev = frame
+        prevOrigin = segmentStart
+        prevTop = 0
+        far = nil
+        started = false
+        scrollStarted = true
+        xOffset = 0
+        knobTemplate = nil
+        knobs.removeAll()
+        movedBody = nil
+        movedColumns = nil
+        edgeBands = (0, 0)
+        lastOverlap = nil
+        staticRun = 0
+        nextLocateAt = -.infinity
+        invalidateLocateIndex()
+        markJoined()
+        return true
+    }
+
     func finish() -> CGImage? {
-        guard let p = prev else { return nil }
-        if !started {
-            write(p, rows: 0..<p.height, origin: 0)
-        } else {
-            let tail = furthest()
-            extend(tail.frame, origin: tail.origin, top: tail.top, until: tail.frame.height)
-        }
+        guard prev != nil else { return nil }
+        _ = writeTail()
         let image = makeImage()
         canvas = [] // the image holds its own copy; long captures are large
         invalidateLocateIndex()
@@ -700,6 +828,15 @@ final class Stitcher: @unchecked Sendable {
     }
 
     // MARK: - Canvas
+
+    private func replaceRows(of frame: PixelFrame, rows: Range<Int>, origin: Int) {
+        let stride = frame.width * 4
+        let dest = (origin + rows.lowerBound)..<(origin + rows.upperBound)
+        canvas.replaceSubrange(dest.lowerBound * stride..<dest.upperBound * stride,
+                               with: frame.bytes[rows.lowerBound * stride..<rows.upperBound * stride])
+        paintKnob(frame, rows: rows, origin: origin)
+        refreshLocateRows(dest)
+    }
 
     private func write(_ f: PixelFrame, rows: Range<Int>, origin: Int) {
         precondition(origin + rows.lowerBound == canvasRows, "canvas must grow contiguously")

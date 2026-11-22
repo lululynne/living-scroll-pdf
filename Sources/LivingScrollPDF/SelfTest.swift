@@ -824,6 +824,8 @@ enum SelfTest {
         recoveryDistance(check)
         hudStability(check)
         honestHUD(check)
+        reflowRecovery(check)
+        reflowSections(check)
         wheelCalibration(check)
 
         // 8. Export round trip.
@@ -891,6 +893,264 @@ enum SelfTest {
 
         print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
         return failures == 0 ? 0 : 1
+    }
+
+    private static func reflowRecovery(_ check: (String, Bool, String) -> Void) {
+        var twice = ReflowRecovery()
+        for position in [0.8, 0.3, 0.29, 0.22, 0.1] {
+            twice.wheel(at: position)
+            twice.located(.none)
+        }
+        check("reflow: lingering inside the 0.3-screen band is only one visit", !twice.pageReflowed, "")
+        twice.wheel(at: 0.6)
+        twice.wheel(at: -0.6) // one wheel event traverses the whole band
+        twice.located(.skipped)
+        check("reflow: an unchecked return cannot declare a layout change", !twice.pageReflowed, "")
+        twice.located(.none)
+        check("reflow: two unsuccessful returns trigger the new section offer", twice.pageReflowed, "")
+        var inFlight = ReflowRecovery()
+        inFlight.wheel(at: 1)
+        let beforeReturn = inFlight.travel
+        for position in [0.1, 0.5, 0.1] { inFlight.wheel(at: position) }
+        inFlight.located(.none, at: beforeReturn)
+        inFlight.located(.none)
+        check("reflow: an older shot and two wheel visits between shots cannot prove two failed returns",
+              !inFlight.pageReflowed, "")
+
+        var misses = ReflowRecovery()
+        misses.wheel(at: 1)
+        for _ in 0..<6 { misses.located(.none) }
+        check("reflow: six misses on the same side cannot trigger", !misses.pageReflowed, "")
+        misses.located(.found(-80))
+        misses.wheel(at: -0.1)
+        for _ in 0..<5 { misses.located(.none); misses.located(.skipped) }
+        check("reflow: a found frame resets the streak and skipped searches do not count", !misses.pageReflowed, "")
+        misses.located(.none)
+        check("reflow: crossing zero and six consecutive misses trigger", misses.pageReflowed, "")
+
+        let browsers = ["com.google.Chrome", "com.apple.Safari", "com.microsoft.edgemac", "company.thebrowser.Browser",
+                        "org.mozilla.firefox", "com.brave.Browser"]
+        check("preload: each supported browser opts in by bundle ID", browsers.allSatisfy {
+            BrowserPreloadTip.applies(to: $0, enabled: true)
+        }, "")
+        check("preload: a non-browser, a helper, an unknown owner and an opted-out browser get no tip",
+              !BrowserPreloadTip.applies(to: "com.apple.Preview", enabled: true)
+              && !BrowserPreloadTip.applies(to: "com.google.Chrome.helper", enabled: true)
+              && !BrowserPreloadTip.applies(to: nil, enabled: true)
+              && !BrowserPreloadTip.applies(to: browsers[0], enabled: false), "")
+        let suite = "LivingScrollPDF.SelfTest." + UUID().uuidString
+        if let defaults = UserDefaults(suiteName: suite) {
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let initiallyOn = BrowserPreloadTip.enabled(in: defaults)
+            BrowserPreloadTip.setEnabled(false, in: defaults)
+            let off = UserDefaults(suiteName: suite).map { BrowserPreloadTip.enabled(in: $0) } == false
+            BrowserPreloadTip.setEnabled(true, in: defaults)
+            check("preload: new settings default on; the saved opt-out can be turned back on",
+                  initiallyOn && off && BrowserPreloadTip.enabled(in: defaults), "")
+        } else { check("preload: settings suite opens", false, "") }
+
+        var hold = ManualTracker.HUDHold()
+        var input = ManualTracker.HUDInput(now: 0, recovering: false, browserTip: true,
+                                           preloadTipUntil: BrowserPreloadTip.duration, frames: 1, shownPx: 200)
+        let tip = L("截网页前，先把页面从头到尾滚一遍，等图片都加载完再开始，就不容易接不上",
+                    "For web pages: scroll through the whole page once so everything loads, then start — it joins more reliably.")
+        let initial = ManualTracker.hudLine(input, hold: &hold)
+        input.now = 3.99
+        let beforeExpiry = ManualTracker.hudLine(input, hold: &hold)
+        input.now = 4
+        check("preload: the localized start tip yields to capture stats at four seconds",
+              initial == tip && beforeExpiry == tip && ManualTracker.hudLine(input, hold: &hold) == ManualTracker.captureStats(frames: 1, shownPx: 200), "")
+
+        input.recovering = true
+        input.pageReflowed = misses.pageReflowed
+        input.wheelSeen = true
+        input.distance = .offset(screens: 0.5)
+        let base = L("这页自己重新排过版了，接不回原处 · 点「接着拼」从这里开新一段，或点「完成」保存已拼好的",
+                     "This page rearranged itself and can’t rejoin the original spot. Choose Continue Here to start a new section, or Done to save what you have.")
+        let browserLine = ManualTracker.hudLine(input, hold: &hold)
+        input.browserTip = false
+        check("reflow: the localized choices replace the distance; browser advice follows the preference",
+              browserLine == base + L("。下次先滚完整页，等图片加载完再截。", " Next time, scroll through the page and let the images load first.")
+              && ManualTracker.hudLine(input, hold: &hold) == base, browserLine)
+        input.pageReflowed = false
+        input.seekingUnchangedArea = true
+        let seeking = ManualTracker.hudLine(input, hold: &hold)
+        check("reflow: a failed return directs the wheel to unchanged content without a distance",
+              seeking == L("往上滚到页面没变的地方，接上会提示", "Scroll up to an unchanged part of the page. It’ll say when it rejoins."), seeking)
+        hold = ManualTracker.HUDHold()
+        input.recovering = false
+        hold.reanchoredUntil = input.now + ManualTracker.joinedDwell
+        let joined = ManualTracker.hudLine(input, hold: &hold)
+        input.now = hold.reanchoredUntil
+        check("reflow: an automatic rejoin shows its own notice once, then the stats",
+              joined == L("页面重新排过了，已从这里接上，往下继续", "The page rearranged itself. Rejoined here — keep scrolling down.")
+              && ManualTracker.hudLine(input, hold: &hold) == ManualTracker.captureStats(frames: 1, shownPx: 200), joined)
+    }
+
+    /// The viewport returns to exactly the same y after a five-column feed rebalances.
+    /// Each column keeps its pixels, but its cards occupy a different column.
+    private static func reflowSections(_ check: (String, Bool, String) -> Void) {
+        let width = 200, height = 200, pageHeight = 1200
+        let row = width * 4, column = row / 5
+        var page = [UInt8](repeating: 255, count: row * pageHeight)
+        var rng = SplitMix(seed: 1050)
+        for y in 0..<pageHeight {
+            for x in 0..<width {
+                let i = y * row + x * 4, card = (y / 50) * 5 + x / (width / 5)
+                page[i] = UInt8(rng.next() % 210)
+                page[i + 1] = UInt8(truncatingIfNeeded: card * 31)
+                page[i + 2] = 255 - page[i]
+            }
+        }
+        var rearranged = page
+        for y in 0..<pageHeight {
+            for (to, from) in [2, 4, 1, 0, 3].enumerated() {
+                let src = y * row + from * column, dst = y * row + to * column
+                rearranged.replaceSubrange(dst..<(dst + column), with: page[src..<(src + column)])
+            }
+        }
+        func shot(_ pixels: [UInt8], _ y: Int) -> PixelFrame {
+            PixelFrame(width: width, height: height, bytes: Array(pixels[y * row..<(y + height) * row]))
+        }
+        for scale in [1, 2] {
+            let st = Stitcher()
+            st.pixelScale = scale
+            let setup = [0, 64, 128, 64].map { st.add(shot(page, $0)) }
+            let rows = st.canvasRows, accepted = st.acceptedFrames
+            let (jump, _) = st.addOrRejoin(shot(page, 850), at: 0)
+            var evidence = ReflowRecovery()
+            evidence.wheel(at: 4)
+            let returned = shot(rearranged, 64)
+            var rejected = true
+            for (i, position) in [0.2, 0.55, 0.1].enumerated() {
+                evidence.wheel(at: position)
+                let (result, verdict) = st.addOrRejoin(returned, at: Double(i + 1) * 10)
+                evidence.located(verdict)
+                rejected = rejected && result == .lost && verdict == .none
+            }
+            check("reflow feed @\(scale)x: returning to the same scroll position never pastes shuffled cards",
+                  setup == [.first, .shifted(64), .shifted(64), .shifted(-64)] && jump == .lost && rejected
+                  && evidence.pageReflowed && st.needsRecovery && st.canvasRows == rows && st.acceptedFrames == accepted,
+                  "setup=\(setup), lost=\(st.lostFrames), detected=\(evidence.pageReflowed)")
+
+            let seed = shot(rearranged, 80)
+            let section = st.segmentStart
+            let wrongSize = PixelFrame(width: 1, height: 1, bytes: [0, 0, 0, 255])
+            let refused = !st.startNewSegment(with: wrongSize, after: section)
+            let started = st.startNewSegment(with: seed, after: section)
+            let seedCount = st.acceptedFrames
+            let duplicate = st.startNewSegment(with: seed, after: section)
+            let next = st.add(shot(rearranged, 144))
+            check("continue @\(scale)x: seeds once from the current frame and accepts the next measured shift",
+                  refused && started && !duplicate && seedCount == accepted + 1 && next == .shifted(64)
+                  && st.acceptedFrames == accepted + 2 && !st.needsRecovery && st.gapFrames == 0, "\(next)")
+            check("continue @\(scale)x: sealed cards never supply a locate direction", st.locate(shot(page, 0)) == nil, "")
+
+            var expected = Array(page[0..<(128 + height) * row])
+            let pad = [UInt8](repeating: 255, count: 12 * scale * row)
+            expected += pad
+            for _ in 0..<(width * scale) { expected += [216, 216, 216, 255] }
+            expected += pad
+            expected += rearranged[80 * row..<(144 + height) * row]
+            let out = st.finish().flatMap { PixelFrame(cgImage: $0) }
+            check("continue @\(scale)x: both sections, furthest old tail and 12/1/12 pt divider match every pixel",
+                  out?.bytes == expected, "height=\(out?.height ?? 0)")
+        }
+        let onlySeeds = Stitcher()
+        let first = shot(page, 0), second = shot(rearranged, 0), third = shot(page, 850)
+        _ = onlySeeds.add(first)
+        _ = onlySeeds.add(second)
+        let one = onlySeeds.startNewSegment(with: second, after: onlySeeds.segmentStart)
+        _ = onlySeeds.add(third)
+        let two = onlySeeds.startNewSegment(with: third, after: onlySeeds.segmentStart)
+        let output = onlySeeds.finish().flatMap { PixelFrame(cgImage: $0) }
+        check("continue then Done: three single-frame sections keep their seeds and two dividers",
+              one && two && onlySeeds.acceptedFrames == 3 && output?.height == 3 * height + 50
+              && output?.bytes.suffix(third.bytes.count).elementsEqual(third.bytes) == true, "")
+
+        var stableHeader = rearranged
+        stableHeader.replaceSubrange(0..<(340 * row), with: page.prefix(340 * row))
+        // One small card in the return viewport has repainted outside the locate samples.
+        stableHeader.replaceSubrange(88 * row..<96 * row, with: rearranged[88 * row..<96 * row])
+        let rewind = Stitcher()
+        for y in stride(from: 0, through: 640, by: 80) { _ = rewind.add(shot(page, y)) }
+        let oldRows = rewind.canvasRows, formerCount = rewind.acceptedFrames
+        let (miss, _) = rewind.addOrRejoin(shot(stableHeader, 950), at: 0)
+        let (waiting, skipped) = rewind.addOrRejoin(shot(page, 560), at: 0.12)
+        check("recovery: a throttled locate preserves the old tail until the return can be judged",
+              waiting == .lost && skipped == .skipped && rewind.needsRecovery && rewind.canvasRows == oldRows, "")
+        let (anchor, location) = rewind.addOrRejoin(shot(stableHeader, 80), at: 10)
+        let seam = 80 + height - height * 22 / 100
+        check("stable header: unique negative locate rewinds to the exact late-write seam",
+              miss == .lost && anchor == .first && location == .found(80 - 640)
+              && oldRows > seam && rewind.canvasRows == seam && rewind.contentOrigin == 80
+              && !rewind.needsRecovery && rewind.gapFrames == 0 && rewind.acceptedFrames == formerCount + 1,
+              "locate=\(location) old=\(oldRows) cut=\(rewind.canvasRows) expected=\(seam)")
+        let steps = stride(from: 160, through: 480, by: 80).map {
+            rewind.addOrRejoin(shot(stableHeader, $0), at: Double($0)).0
+        }
+        let retaken = rewind.finish().flatMap { PixelFrame(cgImage: $0) }
+        let newPixels = stableHeader.prefix((480 + height) * row)
+        check("stable header: subsequent frames grow normally; export has only the new layout and no divider",
+              steps.allSatisfy { $0 == .shifted(80) } && retaken?.bytes.elementsEqual(newPixels) == true,
+              "steps=\(steps), final height=\(retaken?.height ?? 0)")
+
+        let sameSpot = Stitcher()
+        for y in [0, 80, 160, 240, 160, 80] { _ = sameSpot.add(shot(page, y)) }
+        _ = sameSpot.addOrRejoin(shot(rearranged, 950), at: 0)
+        let (back, exact) = sameSpot.addOrRejoin(shot(page, 80), at: 1)
+        let short = sameSpot.finish().flatMap { PixelFrame(cgImage: $0) }
+        check("stable return at zero relative distance: Done drops the stale furthest frame",
+              back == .first && exact == .found(0) && short?.bytes.elementsEqual(page.prefix(280 * row)) == true, "")
+
+        let locked = Stitcher()
+        for y in [0, 80, 160, 240] { _ = locked.add(shot(page, y)) }
+        _ = locked.addOrRejoin(shot(rearranged, 950), at: 0)
+        let committed = locked.canvasRows
+        var checks = 0
+        let stopped = locked.addOrRejoin(shot(page, 0), at: 1) {
+            checks += 1
+            return checks == 1 // Done or Continue arrived while locate was searching.
+        }
+        check("a pending capture command prevents an older verified search from rewinding the canvas",
+              stopped.0 == .lost && locked.needsRecovery && locked.canvasRows == committed, "")
+
+        let pinned = Stitcher()
+        let masthead = page.prefix(100 * row)
+        func withMasthead(_ body: ArraySlice<UInt8>) -> PixelFrame {
+            PixelFrame(width: width, height: height, bytes: Array(masthead) + body)
+        }
+        for y in stride(from: 200, through: 480, by: 40) {
+            _ = pinned.add(withMasthead(page[y * row..<(y + 100) * row]))
+        }
+        var loading = Array(shot(rearranged, 800).bytes.suffix(100 * row))
+        loading.replaceSubrange(0..<60 * row, with: repeatElement(UInt8.max, count: 60 * row))
+        let oldHeight = pinned.canvasRows
+        let headerOnly = pinned.addOrRejoin(withMasthead(loading[...]), at: 0)
+        check("a fixed masthead alone cannot rewind to the top of a long capture",
+              oldHeight > height && headerOnly.0 == .lost && headerOnly.1 == .none && pinned.canvasRows == oldHeight, "")
+
+        func withSidebar(at offset: Int, loading: Bool = false) -> PixelFrame {
+            var body = shot(loading ? rearranged : page, offset).bytes
+            let sidebarBytes = 48 * 4
+            for y in 0..<height {
+                let start = y * row
+                body.replaceSubrange(start..<start + sidebarBytes, with: page[start..<start + sidebarBytes])
+                if (40..<160).contains(loading ? y : offset + y) {
+                    body.replaceSubrange(start + sidebarBytes..<start + row, with: repeatElement(UInt8.max, count: row - sidebarBytes))
+                }
+            }
+            return PixelFrame(width: width, height: height, bytes: body)
+        }
+        let sidebar = Stitcher()
+        for y in stride(from: 0, through: 640, by: 20) { _ = sidebar.add(withSidebar(at: y)) }
+        let snapshot = sidebar.canvasRows
+        let blank = withSidebar(at: 950, loading: true)
+        let sidebarHint = sidebar.locate(blank)
+        let sidebarOnly = sidebar.addOrRejoin(blank, at: 0)
+        check("a fixed sidebar matching across blank placeholders cannot rewind a long capture",
+              snapshot > height && sidebarHint == -640 && sidebarOnly.0 == .lost && sidebarOnly.1 == .none
+              && sidebar.canvasRows == snapshot, "display hit=\(String(describing: sidebarHint)), rows=\(snapshot)")
     }
 
     /// From codex's review: repeated glyph shapes with a unique right-hand ID per message.

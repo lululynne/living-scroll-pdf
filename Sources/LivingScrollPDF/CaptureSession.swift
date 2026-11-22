@@ -25,7 +25,7 @@ final class CaptureSession {
     private var timer: Timer?
     private var inFlight = false
     private var finishing = false
-    var isFinishing: Bool { finishing && !ended }
+    var isFinishing: Bool { (finishing || finishAfterSection) && !ended }
     private var autoScroll = false
     /// Auto-scroll step size; resamples, backs up and halves after a lost frame.
     private var pacer = AutoPacer()
@@ -40,13 +40,15 @@ final class CaptureSession {
     private var inputSeen = false
     /// The last frame could not be joined and nothing has been joined since.
     private var recovering = false
+    private var reflow = ReflowRecovery()
+    private var requestedSection: Int?
+    private var finishAfterSection = false
+    /// Done, Cancel and Continue can arrive while the stitch queue is still searching.
+    private let acceptsFrames = OSAllocatedUnfairLock(initialState: true)
+    private var browserBundleID: String?
+    private var preloadTipUntil = -Double.infinity
     /// Memory for the one status line. The session does not choose the sentence.
     private var hudHold = ManualTracker.HUDHold()
-    /// Frames handed to the stitch queue and not yet inside `add`. A locate that sees
-    /// this above zero does not search, so a waiting frame is not stuck behind it.
-    private let framesWaiting = OSAllocatedUnfairLock(initialState: 0)
-    /// Bumped for every judged frame. A locate result from an older frame is ignored.
-    private var locateGeneration = 0
     /// Errors stay until a frame is judged after `urgentUntil`. The stats line must not cover them.
     private var urgentStatus: String?
     /// Frames arrive every tick, so a notice needs a minimum time on the bar or nobody can read it.
@@ -72,6 +74,7 @@ final class CaptureSession {
         border = BorderWindow()
         hud = HUDPanel()
         hud.onAuto = { [weak self] in self?.toggleAuto() }
+        hud.onContinue = { [weak self] in self?.continueHere() }
         hud.onDone = { [weak self] in self?.finish() }
         hud.onCancel = { [weak self] in self?.cancel() }
     }
@@ -83,6 +86,7 @@ final class CaptureSession {
                 fail(L("找不到刚才选中的窗口了", "The window you picked is gone"))
                 return
             }
+            browserBundleID = window.owningApplication?.bundleIdentifier
             // A window filter measures `sourceRect` from the corner of the window's capture area, and
             // that area can grow on the fly (Chrome attaches child windows, popups, bubbles to its
             // window): the picked region then slides, toolbars and empty space come into the frame.
@@ -118,7 +122,12 @@ final class CaptureSession {
         placeChrome()
         border.orderFrontRegardless()
         hud.orderFrontRegardless()
-        update(L("开始了：去滚你的窗口，我跟着截", "Go ahead and scroll the window, I'll keep up"))
+        if showsBrowserTip {
+            preloadTipUntil = now + BrowserPreloadTip.duration
+            update(BrowserPreloadTip.text, detailed: true)
+        } else {
+            update(L("开始了：去滚你的窗口，我跟着截", "Go ahead and scroll the window, I'll keep up"))
+        }
         let t = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
@@ -135,52 +144,77 @@ final class CaptureSession {
 
     // MARK: - Loop
 
+    private var showsBrowserTip: Bool {
+        BrowserPreloadTip.applies(to: browserBundleID, enabled: BrowserPreloadTip.enabled())
+    }
+
+    private func continueHere() {
+        guard recovering, reflow.pageReflowed, !isFinishing, requestedSection == nil else { return }
+        acceptsFrames.withLock { $0 = false }
+        requestedSection = lastStats.segment
+        tick()
+    }
+
     private func tick() {
         guard !inFlight, !finishing, let filter, let config else { return }
         placeChrome()
+        let section = requestedSection
+        let newSection = section != nil
         if autoScroll, Date().timeIntervalSince(lastScroll) < 0.35 { return }
         // Manual, wheel-driven: only look when the moving mark has reached the seam line (or the
         // user stopped short of it). Without recent wheel events (keyboard, dragging the scroll
         // bar) every tick is matched over the full range, as before.
         var request: ManualTracker.Capture?
-        if !autoScroll, stitcher.acceptedFrames > 0, let t = tracker {
+        if !newSection, !autoScroll, lastStats.frames > 0, let t = tracker {
             // The bar and the decision to take a frame are separate. A quiet wheel still
             // redraws, so a dwell can expire and a recovery distance is not replaced later
             // by a different sentence. Capture itself still waits for a live wheel.
-            if t.active(at: now) || recovering || hudHold.dwells(at: now) {
+            if t.active(at: now) || recovering || hudHold.dwells(at: now) || preloadTipUntil.isFinite {
                 publishHUD(lost: false, nonzeroShift: false)
             }
             if t.active(at: now) {
-                guard let r = tracker?.capture(at: now) else { return }
-                request = r
+                request = tracker?.capture(at: now)
+                if request == nil && !recovering { return }
             }
         }
         let auto = autoScroll
+        let rawAtTake = tracker?.raw ?? 0
+        let travelAtTake = reflow.travel
         // The region follows the window if it is moved.
         config.sourceRect = displayRect()
         inFlight = true
         Task { @MainActor in
+            defer {
+                inFlight = false
+                if newSection {
+                    requestedSection = nil
+                    let resume = !finishAfterSection && !finishing
+                    acceptsFrames.withLock { $0 = resume }
+                }
+                if !finishing {
+                    if requestedSection != nil { tick() }
+                    else if finishAfterSection { finish() }
+                }
+            }
             let image: CGImage
             do {
                 image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
             } catch {
-                inFlight = false
                 captureFailures += 1
-                if captureFailures == 25, !finishing { // about three seconds of failures
+                if (newSection || captureFailures == 25), !finishing {
                     stopAuto()
                     showUrgent(L("截不到画面了（\(error.localizedDescription)）· 点完成可保存已截的部分", "Can't capture the window (\(error.localizedDescription)) · press Done to save what you have"))
                 }
                 return
             }
             captureFailures = 0
+            if !newSection && (requestedSection != nil || (finishing && recovering)) { return }
             guard let frame = PixelFrame(cgImage: image) else {
-                inFlight = false
                 return
             }
             // Part of the picture is outside the window (moved off screen, or the capture area slid):
             // it is not the picked region, so it is neither stitched nor counted as lost.
             if frame.reachesOutsideWindow {
-                inFlight = false
                 showUrgent(L("截取区域跑到窗口外面了，这一张不拼 · 把窗口挪回原处或点完成", "The capture area is outside the window, this frame is skipped · move the window back or press Done"))
                 return
             }
@@ -200,11 +234,9 @@ final class CaptureSession {
             if auto {
                 switch settler.observe(frame, at: now) {
                 case .waiting:
-                    inFlight = false
                     return
                 case .timedOut:
                     // Never stitch a picture that is still moving, and do not scroll on either.
-                    inFlight = false
                     settler.reset()
                     stopAuto()
                     showUrgent(L("画面一直在动，停不稳，自动已暂停 · 等它安静下来再点自动，或点完成保存已收的部分", "The picture keeps moving, auto-scroll paused · press Auto again once it settles, or Done to keep what you have"))
@@ -216,20 +248,40 @@ final class CaptureSession {
             let stitcher = self.stitcher
             let expected = auto ? pacer.expected : request?.expected
             let tolerance = auto ? max(16 * stitcher.pixelScale, frame.height * 12 / 100) : (request?.tolerance ?? 0)
-            let manual = !auto
-            locateGeneration += 1
-            let generation = locateGeneration
-            let waiting = framesWaiting
-            waiting.withLock { $0 += 1 }
-            let (outcome, height, frames, dropped, edges, share, unjoined) = await withCheckedContinuation { cont in
+            let searchedAt = now
+            let acceptsFrames = self.acceptsFrames
+            let (outcome, verdict, height, frames, dropped, edges, share, unjoined, segment) = await withCheckedContinuation { cont in
                 work.async {
-                    waiting.withLock { $0 -= 1 }
-                    let o = stitcher.add(frame, expected: expected, tolerance: tolerance)
-                    cont.resume(returning: (o, stitcher.canvasRows, stitcher.acceptedFrames, stitcher.lostFrames, stitcher.edgeBands, stitcher.movingShare, stitcher.needsRecovery))
+                    let (o, verdict): (Stitcher.Outcome, Stitcher.LocateVerdict)
+                    if let section {
+                        (o, verdict) = (stitcher.startNewSegment(with: frame, after: section) ? .first : .lost, .skipped)
+                    } else {
+                        (o, verdict) = stitcher.addOrRejoin(frame, expected: expected, tolerance: tolerance, at: searchedAt) {
+                            acceptsFrames.withLock { $0 }
+                        }
+                    }
+                    cont.resume(returning: (o, verdict, stitcher.capturedRows, stitcher.acceptedFrames, stitcher.lostFrames,
+                                            stitcher.edgeBands, stitcher.movingShare, stitcher.needsRecovery, stitcher.segmentStart))
                 }
             }
-            inFlight = false
             guard !finishing else { return }
+            if !newSection && requestedSection != nil { return }
+            if newSection && outcome != .first {
+                showUrgent(L("这一帧不能开新一段 · 把窗口移回选取区域后再点「接着拼」", "Couldn’t start a section with this frame. Move the window back into the capture area and try Continue Here again."))
+                return
+            }
+            if case .first = outcome {
+                tracker?.reanchor(body: max(1, Int((Double(frame.height) * share).rounded())), rawAtTake: rawAtTake)
+                lastSeenFrame = nil
+                hudHold = ManualTracker.HUDHold()
+                if newSection { urgentStatus = nil }
+                if case .found = verdict {
+                    hudHold.reanchoredUntil = now + ManualTracker.joinedDwell
+                    preloadTipUntil = -.infinity
+                    urgentStatus = nil
+                    if auto { pacer = AutoPacer() }
+                }
+            }
             if ProcessInfo.processInfo.environment["JZ_TEST_OWNER"] != nil { print("frame \(dumpIndex): \(outcome)") }
             trace("frame\t\(dumpIndex)\t\(outcome)\texpected=\(expected.map(String.init) ?? "nil")\ttol=\(tolerance)\traw=\(tracker?.raw ?? 0)\tratio=\(tracker?.ratio ?? 0)\test=\(tracker?.estimate ?? 0)\tbody=\(tracker?.body ?? 0)")
             if !auto {
@@ -237,33 +289,21 @@ final class CaptureSession {
                 case (.shifted(let d), let r?) where d != 0: tracker?.placed(d: d, capture: r, edges: edges)
                 case (.lost, let r?): tracker?.lost(r)
                 case (.shifted(let d), nil) where d != 0: tracker?.resync()
-                case (.first, _): tracker?.resync()
                 default: break
                 }
                 let same = lastSeenFrame.map { $0.width == frame.width && $0.height == frame.height && $0.bytes == frame.bytes } ?? false
                 tracker?.noteJudgedFrame(identical: same, at: now)
                 lastSeenFrame = frame
             }
-            // Picture offset is display-only. It is not written into `raw`, so capture() and
-            // the acceptance window stay on the wheel. A search runs after `add` has already
-            // returned, and steps aside when another frame is waiting.
-            let lostManual = manual && outcome == .lost
-            if !lostManual {
+            if auto || !unjoined {
                 ManualTracker.dropPicture(&hudHold)
-            } else if let request, let tracker, tracker.wheelCredible, tracker.wheelSeen {
-                let take = request.raw
-                let searchedAt = now
-                work.async {
-                    let busy = waiting.withLock { $0 > 0 }
-                    let verdict: Stitcher.LocateVerdict = busy ? .skipped : stitcher.locateLost(frame, at: searchedAt)
-                    Task { @MainActor [weak self] in
-                        guard let self, self.locateGeneration == generation, !self.finishing else { return }
-                        ManualTracker.integrateLocate(verdict, rawAtTake: take, now: self.now, hold: &self.hudHold)
-                        if self.recovering {
-                            self.publishHUD(lost: true, nonzeroShift: false)
-                        }
-                    }
+                reflow = ReflowRecovery()
+            } else if let tracker, tracker.wheelCredible, tracker.wheelSeen {
+                if !recovering {
+                    reflow.wheel(at: rawAtTake * tracker.ratio / Double(tracker.body))
+                    reflow.wheel(at: tracker.raw * tracker.ratio / Double(tracker.body))
                 }
+                reflow.located(verdict, at: travelAtTake)
             }
             // Manual mode: the seam line and overlap limits follow the part of the view that scrolls.
             if case .shifted(let d) = outcome, d != 0 { tracker?.body = max(64, Int((Double(frame.height) * share).rounded())) }
@@ -272,7 +312,7 @@ final class CaptureSession {
                 NSSound(named: "Funk")?.play()
             }
             recovering = unjoined
-            report(outcome, height: height, frames: frames, dropped: dropped)
+            report(outcome, height: height, frames: frames, dropped: dropped, segment: segment)
             guard autoScroll else { return }
             switch pacer.next(after: outcome, movingShare: share) {
             case .resample:
@@ -289,10 +329,10 @@ final class CaptureSession {
         }
     }
 
-    private var lastStats = (height: 0, frames: 0, dropped: 0)
+    private var lastStats = (height: 0, frames: 0, dropped: 0, segment: 0)
 
-    private func report(_ o: Stitcher.Outcome, height: Int, frames: Int, dropped: Int) {
-        lastStats = (height, frames, dropped)
+    private func report(_ o: Stitcher.Outcome, height: Int, frames: Int, dropped: Int, segment: Int) {
+        lastStats = (height, frames, dropped, segment)
         // A judged frame means the previous error (missed capture, region off-window) is over.
         if now >= urgentUntil { urgentStatus = nil }
         let nonzero: Bool
@@ -309,10 +349,15 @@ final class CaptureSession {
 
     /// One sentence for the bar. Wheel events, ticks and finished frames all come through here.
     private func publishHUD(lost: Bool, nonzeroShift: Bool) {
+        if now >= preloadTipUntil { preloadTipUntil = -.infinity }
         let shown = max(lastStats.height, Int(sourceRect.height * CGFloat(scale)))
         let input = ManualTracker.HUDInput(
             now: now,
             recovering: recovering,
+            pageReflowed: reflow.pageReflowed,
+            seekingUnchangedArea: reflow.seekingUnchangedArea,
+            browserTip: showsBrowserTip,
+            preloadTipUntil: preloadTipUntil,
             autoScroll: autoScroll,
             lost: lost,
             nonzeroShift: nonzeroShift,
@@ -328,7 +373,10 @@ final class CaptureSession {
             urgent: urgentStatus,
             lastWheelAt: tracker?.lastWheel ?? -.infinity
         )
-        update(ManualTracker.hudLine(input, hold: &hudHold))
+        let line = ManualTracker.hudLine(input, hold: &hudHold)
+        let detailed = reflow.seekingUnchangedArea || reflow.pageReflowed || now < hudHold.reanchoredUntil
+            || (input.browserTip && now < preloadTipUntil)
+        update(line, detailed: detailed)
     }
 
     /// Wheel and trackpad events (inertia included) over the picked region of the target window.
@@ -352,6 +400,9 @@ final class CaptureSession {
                 // Distance figures follow the wheel itself, not the next captured frame.
                 // `.over` does too: the dwell starts when the wheel crosses the line.
                 if let t = self.tracker {
+                    if self.recovering && t.wheelCredible {
+                        self.reflow.wheel(at: t.raw * t.ratio / Double(t.body))
+                    }
                     let tooFar: Bool
                     if case .over = t.gauge { tooFar = true } else { tooFar = false }
                     if self.recovering || tooFar || self.hudHold.dwells(at: self.now) {
@@ -367,6 +418,7 @@ final class CaptureSession {
                 guard let self else { return }
                 self.noteInput()
                 self.tracker?.invalidateWheel()
+                if !self.reflow.pageReflowed { self.reflow = ReflowRecovery() }
                 if self.recovering { self.publishHUD(lost: false, nonzeroShift: false) }
             }
         }
@@ -484,6 +536,14 @@ final class CaptureSession {
 
     private func finish() {
         guard !finishing else { return }
+        if requestedSection != nil {
+            finishAfterSection = true
+            hud.setBusy()
+            return
+        }
+        // Preserve the usual last shot while capturing normally. During a loss, save the
+        // visible result before an in-flight locate can rewind its tail.
+        acceptsFrames.withLock { $0 = false }
         finishing = true
         autoScroll = false
         timer?.invalidate()
@@ -542,7 +602,8 @@ final class CaptureSession {
     }
 
     private func cancel() {
-        guard !finishing else { return }
+        guard !isFinishing else { return }
+        acceptsFrames.withLock { $0 = false }
         finishing = true
         autoScroll = false
         timer?.invalidate()
@@ -581,9 +642,9 @@ final class CaptureSession {
 
     // MARK: - Chrome
 
-    private func update(_ text: String) {
+    private func update(_ text: String, detailed: Bool = false) {
         status = text
-        hud.setStatus(text)
+        hud.setStatus(text, detailed: detailed, showsContinue: recovering && reflow.pageReflowed && !finishing)
     }
 
     /// Keeps the red frame and the control bar glued to the window if it moves.
@@ -593,8 +654,9 @@ final class CaptureSession {
         let r = Coords.toAppKit(region)
         border.setFrame(r.insetBy(dx: -3, dy: -3), display: true)
 
-        let size = hud.frame.size
         let screen = NSScreen.screens.first { $0.frame.intersects(r) }?.visibleFrame ?? NSScreen.main!.visibleFrame
+        hud.fit(availableWidth: screen.width - 16)
+        let size = hud.frame.size
         var origin = NSPoint(x: r.midX - size.width / 2, y: r.minY - size.height - 10)
         if origin.y < screen.minY { origin.y = r.maxY + 10 }
         if origin.y + size.height > screen.maxY { origin.y = r.minY + 10 }
@@ -629,12 +691,16 @@ private final class BorderView: NSView {
 
 final class HUDPanel: NSPanel {
     var onAuto: () -> Void = {}
+    var onContinue: () -> Void = {}
     var onDone: () -> Void = {}
     var onCancel: () -> Void = {}
 
     private let label = NSTextField(labelWithString: "")
     private let autoButton = NSButton(title: L("自动滚到底", "Auto-scroll"), target: nil, action: nil)
-    private var buttons: [NSButton] = []
+    private let continueButton = NSButton(title: L("接着拼", "Continue Here"), target: nil, action: nil)
+    private let actions = NSStackView()
+    private var detailed = false
+    private var availableWidth: CGFloat = 560
 
     init() {
         super.init(contentRect: NSRect(x: 0, y: 0, width: 560, height: 46),
@@ -663,32 +729,66 @@ final class HUDPanel: NSPanel {
 
         autoButton.target = self
         autoButton.action = #selector(autoTapped)
+        continueButton.target = self
+        continueButton.action = #selector(continueTapped)
         let done = NSButton(title: L("完成", "Done"), target: self, action: #selector(doneTapped))
         done.keyEquivalent = "\r"
         done.bezelColor = .systemRed
         let cancel = NSButton(title: L("取消", "Cancel"), target: self, action: #selector(cancelTapped))
-        buttons = [autoButton, done, cancel]
-        for b in buttons { b.bezelStyle = .rounded; b.controlSize = .regular }
-
-        let stack = NSStackView(views: [label, autoButton, done, cancel])
-        stack.orientation = .horizontal
-        stack.spacing = 8
-        stack.edgeInsets = NSEdgeInsets(top: 8, left: 14, bottom: 8, right: 10)
-        stack.frame = bg.bounds
-        stack.autoresizingMask = [.width, .height]
-        bg.addSubview(stack)
+        actions.orientation = .horizontal
+        actions.spacing = 8
+        for button in [autoButton, continueButton, done, cancel] {
+            button.bezelStyle = .rounded
+            button.controlSize = .regular
+            actions.addArrangedSubview(button)
+        }
+        continueButton.isHidden = true
+        bg.addSubview(actions)
+        bg.addSubview(label)
         contentView = bg
+        layoutContents()
     }
 
-    func setStatus(_ text: String) {
-        guard label.stringValue != text else { return }
+    func setStatus(_ text: String, detailed: Bool = false, showsContinue: Bool = false) {
+        guard label.stringValue != text || self.detailed != detailed || continueButton.isHidden == showsContinue else { return }
         label.stringValue = text
+        self.detailed = detailed
+        continueButton.isHidden = !showsContinue
+        layoutContents()
     }
-    func setAuto(_ on: Bool) { autoButton.title = on ? L("停止自动", "Stop") : L("自动滚到底", "Auto-scroll") }
+
+    func fit(availableWidth: CGFloat) {
+        guard self.availableWidth != availableWidth else { return }
+        self.availableWidth = availableWidth
+        layoutContents()
+    }
+
+    /// Long instructions get the full width above the controls and wrap on a small screen.
+    private func layoutContents() {
+        let text = label.attributedStringValue
+        let width = min(availableWidth, detailed ? max(560, ceil(text.size().width) + 28) : 560)
+        let controls = actions.fittingSize
+        let labelWidth = max(1, width - 24 - (detailed ? 0 : controls.width + 8))
+        label.lineBreakMode = detailed ? .byWordWrapping : .byTruncatingTail
+        label.maximumNumberOfLines = detailed ? 0 : 1
+        let textBounds = NSRect(x: 0, y: 0, width: labelWidth, height: .greatestFiniteMagnitude)
+        let labelHeight = detailed ? ceil(label.cell?.cellSize(forBounds: textBounds).height ?? 20) : 20
+        let height = detailed ? 8 + controls.height + 4 + labelHeight + 8 : 46
+        if frame.size != NSSize(width: width, height: height) { setContentSize(NSSize(width: width, height: height)) }
+        let buttonY = detailed ? 8 : (height - controls.height) / 2
+        actions.frame = NSRect(origin: NSPoint(x: width - controls.width - 10, y: buttonY), size: controls)
+        label.frame = NSRect(x: 14, y: detailed ? actions.frame.maxY + 4 : (height - labelHeight) / 2,
+                             width: labelWidth, height: labelHeight)
+    }
+    func setAuto(_ on: Bool) {
+        autoButton.title = on ? L("停止自动", "Stop") : L("自动滚到底", "Auto-scroll")
+        layoutContents()
+    }
     /// Export has started; nothing on the bar can change the outcome any more.
-    func setBusy() { buttons.forEach { $0.isEnabled = false } }
+    func setBusy() { actions.arrangedSubviews.compactMap { $0 as? NSButton }.forEach { $0.isEnabled = false } }
 
     @objc private func autoTapped() { onAuto() }
+    @objc private func continueTapped() { onContinue() }
     @objc private func doneTapped() { onDone() }
     @objc private func cancelTapped() { onCancel() }
 }

@@ -97,6 +97,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             layout.submenu = layouts
             menu.addItem(layout)
+            let preload = NSMenuItem(title: L("网页预加载提醒", "Web Page Preload Reminder"), action: nil, keyEquivalent: "")
+            let reminders = NSMenu()
+            for (title, enabled) in [(L("显示提醒", "Show Reminder"), true), (L("不再提示", "Don’t Show Again"), false)] {
+                let item = NSMenuItem(title: title, action: #selector(choosePreloadReminder(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = enabled
+                item.state = BrowserPreloadTip.enabled() == enabled ? .on : .off
+                reminders.addItem(item)
+            }
+            preload.submenu = reminders
+            menu.addItem(preload)
             let language = NSMenuItem(title: L("界面语言", "Language"), action: nil, keyEquivalent: "")
             let languages = NSMenu()
             for (title, value) in [(L("跟随系统", "Follow System"), Lang.system), ("中文", .zh), ("English", .en)] {
@@ -136,6 +147,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
         installEditingMenu()
         editors.forEach { $0.refreshLanguage() }
+    }
+
+    @objc private func choosePreloadReminder(_ sender: NSMenuItem) {
+        guard let enabled = sender.representedObject as? Bool else { return }
+        BrowserPreloadTip.setEnabled(enabled)
+        sender.menu?.items.forEach { $0.state = $0 === sender ? .on : .off }
     }
 
     /// Standard responder-chain actions also work inside a filename, search field or text annotation.

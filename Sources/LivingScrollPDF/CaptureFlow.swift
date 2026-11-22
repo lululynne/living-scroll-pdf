@@ -1,5 +1,89 @@
 import Foundation
 
+enum BrowserPreloadTip {
+    static let duration = 4.0
+    private static let hiddenKey = "hideBrowserPreloadTip"
+    static func enabled(in defaults: UserDefaults = .standard) -> Bool {
+        !defaults.bool(forKey: hiddenKey)
+    }
+    static func setEnabled(_ enabled: Bool, in defaults: UserDefaults = .standard) {
+        defaults.set(!enabled, forKey: hiddenKey)
+    }
+
+    private static let browsers: Set<String> = [
+        "com.apple.safari", "com.apple.safaritechnologypreview",
+        "com.google.chrome", "com.google.chrome.beta", "com.google.chrome.dev", "com.google.chrome.canary",
+        "org.chromium.chromium", "com.microsoft.edgemac", "com.microsoft.edgemac.beta",
+        "com.microsoft.edgemac.dev", "com.microsoft.edgemac.canary", "company.thebrowser.browser",
+        "org.mozilla.firefox", "org.mozilla.firefoxdeveloperedition", "org.mozilla.nightly",
+        "com.brave.browser", "com.brave.browser.beta", "com.brave.browser.nightly",
+        "com.vivaldi.vivaldi", "com.operasoftware.opera"
+    ]
+
+    static func applies(to bundleID: String?, enabled: Bool) -> Bool {
+        guard enabled, let bundleID else { return false }
+        return browsers.contains(bundleID.lowercased())
+    }
+
+    static var text: String {
+        L("截网页前，先把页面从头到尾滚一遍，等图片都加载完再开始，就不容易接不上",
+          "For web pages: scroll through the whole page once so everything loads, then start — it joins more reliably.")
+    }
+}
+
+/// Evidence collected only while a manual capture has lost its place. A wheel crossing
+/// requests a conclusion; a failed picture search confirms it.
+struct ReflowRecovery {
+    static let arrivalRadius = 0.3
+    static let arrivalsNeeded = 2
+    static let missesNeeded = 6
+
+    private var previous: Double?
+    struct Travel {
+        fileprivate var arrivals = 0
+        fileprivate var crossedZero = false
+    }
+    private(set) var travel = Travel()
+    private var checkedArrival = 0
+    private var missedArrivals = 0
+    private var misses = 0
+    private(set) var seekingUnchangedArea = false
+    private(set) var pageReflowed = false
+
+    mutating func wheel(at screens: Double) {
+        if let previous {
+            let crossed = (previous > 0 && screens <= 0) || (previous < 0 && screens >= 0)
+            if abs(previous) >= Self.arrivalRadius && (abs(screens) < Self.arrivalRadius || crossed) {
+                travel.arrivals += 1
+            }
+            if crossed { travel.crossedZero = true }
+        }
+        previous = screens
+    }
+
+    mutating func located(_ result: Stitcher.LocateVerdict, at shot: Travel? = nil) {
+        guard !pageReflowed else { return }
+        let atTake = shot ?? travel
+        switch result {
+        case .skipped: break
+        case .found:
+            travel = Travel()
+            checkedArrival = 0
+            missedArrivals = 0
+            misses = 0
+            seekingUnchangedArea = false
+        case .none:
+            misses += 1
+            if atTake.arrivals > checkedArrival {
+                missedArrivals += 1
+                checkedArrival = atTake.arrivals
+            }
+            seekingUnchangedArea = missedArrivals > 0 || atTake.crossedZero
+            pageReflowed = missedArrivals >= Self.arrivalsNeeded || (atTake.crossedZero && misses >= Self.missesNeeded)
+        }
+    }
+}
+
 // Capture-loop decisions that do not need the screen: when a frame counts as settled, how
 // auto-scroll paces itself, and when manual mode takes the next frame. CaptureSession and the
 // self-test drive the same code.
@@ -287,6 +371,16 @@ struct ManualTracker {
         wheelCredible = true
     }
 
+    /// A new visual anchor starts a fresh calibration. Keep wheel input received after the shot.
+    mutating func reanchor(body: Int, rawAtTake: Double) {
+        let sinceShot = raw - rawAtTake, last = lastWheel
+        self = ManualTracker(body: body, pixelScale: pixelScale)
+        if sinceShot != 0 {
+            raw = sinceShot
+            lastWheel = last
+        }
+    }
+
     /// After a judged frame. Identical pixels plus a still wheel mean the page absorbed the
     /// events (top or bottom); rewind `raw` so empty notches do not pile up. The stitcher
     /// has already seen this frame.
@@ -391,6 +485,7 @@ struct ManualTracker {
     /// What the bar is allowed to remember between calls. The session keeps one of these;
     /// it does not choose the sentence itself.
     struct HUDHold: Equatable {
+        var reanchoredUntil = -Double.infinity
         var overUntil = -Double.infinity
         var overLatched = false
         var joinedUntil = -Double.infinity
@@ -405,7 +500,7 @@ struct ManualTracker {
         /// Canvas match used only for the sentence. Nil when nothing is lost, or auto-scroll is on.
         var picture: PictureHold? = nil
 
-        func dwells(at _: Double) -> Bool { overLatched || joinedLatched }
+        func dwells(at time: Double) -> Bool { overLatched || joinedLatched || time <= reanchoredUntil }
     }
 
     /// Fold one locate result into the picture hold. Does not read or write the wheel total.
@@ -436,6 +531,10 @@ struct ManualTracker {
     struct HUDInput: Equatable {
         var now: Double
         var recovering: Bool
+        var pageReflowed = false
+        var seekingUnchangedArea = false
+        var browserTip = false
+        var preloadTipUntil = -Double.infinity
         var autoScroll: Bool = false
         var lost: Bool = false
         /// Measured shift was nonzero. Manual copy does not prefix on this; both kinds of
@@ -482,6 +581,19 @@ struct ManualTracker {
     /// A non-credible wheel — or no wheel at all — uses the long sentence, picture included.
     static func hudLine(_ input: HUDInput, hold: inout HUDHold) -> String {
         if let urgent = input.urgent { return urgent }
+        if input.recovering && input.pageReflowed {
+            let text = L("这页自己重新排过版了，接不回原处 · 点「接着拼」从这里开新一段，或点「完成」保存已拼好的",
+                         "This page rearranged itself and can’t rejoin the original spot. Choose Continue Here to start a new section, or Done to save what you have.")
+            guard input.browserTip else { return text }
+            return text + L("。下次先滚完整页，等图片加载完再截。", " Next time, scroll through the page and let the images load first.")
+        }
+        if input.recovering && input.seekingUnchangedArea {
+            return L("往上滚到页面没变的地方，接上会提示", "Scroll up to an unchanged part of the page. It’ll say when it rejoins.")
+        }
+        if !input.recovering && input.now < hold.reanchoredUntil {
+            return L("页面重新排过了，已从这里接上，往下继续", "The page rearranged itself. Rejoined here — keep scrolling down.")
+        }
+        if input.browserTip && !input.recovering && input.now < input.preloadTipUntil { return BrowserPreloadTip.text }
         let stats = captureStats(frames: input.frames, shownPx: input.shownPx)
         if input.autoScroll {
             if input.lost {
