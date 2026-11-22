@@ -31,12 +31,13 @@ enum BrowserPreloadTip {
     }
 }
 
-/// Evidence collected only while a manual capture has lost its place. A wheel crossing
-/// requests a conclusion; a failed picture search confirms it.
+/// Evidence for offering a new section while the capture cannot rejoin its previous one.
 struct ReflowRecovery {
     static let arrivalRadius = 0.3
     static let arrivalsNeeded = 2
     static let missesNeeded = 6
+    private static let untrackedDelay = 3.0
+    private static let untrackedMissesNeeded = 3
 
     private var previous: Double?
     struct Travel {
@@ -47,8 +48,41 @@ struct ReflowRecovery {
     private var checkedArrival = 0
     private var missedArrivals = 0
     private var misses = 0
+    private var untrackedLoss: (since: Double, misses: Int)?
     private(set) var seekingUnchangedArea = false
+    /// Latches the offer to start a section. Only a later pixel mismatch can confirm reflow.
     private(set) var pageReflowed = false
+
+    enum Shot {
+        case wheel(Travel, screens: Double)
+        case untracked(time: Double)
+
+        var returnedToReference: Bool {
+            guard case .wheel(let travel, let screens) = self else { return false }
+            return travel.arrivals > 0 && abs(screens) < ReflowRecovery.arrivalRadius
+        }
+    }
+
+    func snapshot(at time: Double, tracker: ManualTracker?, auto: Bool) -> Shot {
+        guard !auto, let tracker, tracker.wheelCredible, tracker.wheelSeen else { return .untracked(time: time) }
+        return .wheel(travel, screens: tracker.wheelScreens)
+    }
+
+    mutating func observe(_ result: Stitcher.LocateVerdict, from shot: Shot, tracker: ManualTracker?, firstLoss: Bool) {
+        switch shot {
+        case .wheel(let travel, let screens):
+            // A subsequent key or drag invalidates the distance, but does not turn
+            // this earlier shot into evidence from keyboard or scroll-bar input.
+            guard let tracker, tracker.wheelCredible else { return }
+            if firstLoss {
+                wheel(at: screens)
+                wheel(at: tracker.wheelScreens)
+            }
+            located(result, at: travel)
+        case .untracked(let time):
+            locatedWithoutWheel(result, at: time)
+        }
+    }
 
     mutating func wheel(at screens: Double) {
         if let previous {
@@ -63,15 +97,12 @@ struct ReflowRecovery {
 
     mutating func located(_ result: Stitcher.LocateVerdict, at shot: Travel? = nil) {
         guard !pageReflowed else { return }
+        untrackedLoss = nil
         let atTake = shot ?? travel
         switch result {
         case .skipped: break
         case .found:
-            travel = Travel()
-            checkedArrival = 0
-            missedArrivals = 0
-            misses = 0
-            seekingUnchangedArea = false
+            clearWheelSearches()
         case .none:
             misses += 1
             if atTake.arrivals > checkedArrival {
@@ -81,6 +112,36 @@ struct ReflowRecovery {
             seekingUnchangedArea = missedArrivals > 0 || atTake.crossedZero
             pageReflowed = missedArrivals >= Self.arrivalsNeeded || (atTake.crossedZero && misses >= Self.missesNeeded)
         }
+    }
+
+    /// Keys, scroll-bar drags and automatic steps invalidate wheel distances. They can
+    /// arrive repeatedly during a single loss, so they leave its picture-search clock alone.
+    mutating func invalidateWheel() {
+        previous = nil
+        clearWheelSearches()
+    }
+
+    private mutating func clearWheelSearches() {
+        travel = Travel()
+        checkedArrival = 0
+        missedArrivals = 0
+        misses = 0
+        seekingUnchangedArea = false
+    }
+
+    private mutating func locatedWithoutWheel(_ result: Stitcher.LocateVerdict, at shotTime: Double) {
+        guard !pageReflowed else { return }
+        var loss = untrackedLoss ?? (since: shotTime, misses: 0)
+        switch result {
+        case .skipped: break
+        case .found:
+            untrackedLoss = nil
+            return
+        case .none:
+            loss.misses += 1
+            pageReflowed = loss.misses >= Self.untrackedMissesNeeded && shotTime - loss.since >= Self.untrackedDelay
+        }
+        untrackedLoss = loss
     }
 }
 
@@ -264,6 +325,7 @@ struct ManualTracker {
         return min(4, max(0.25, samples.reduce(0) { $0 + $1.d } / r))
     }
     var estimate: Int { Int((raw * ratio).rounded()) }
+    var wheelScreens: Double { raw * ratio / Double(body) }
 
     /// Overlap the join needs: both edge bands plus room to check, never less than a quarter.
     var minOverlap: Int { max(body / 4, edges.top + edges.bottom + max(48 * pixelScale, body * 15 / 100)) }
@@ -486,6 +548,7 @@ struct ManualTracker {
     /// it does not choose the sentence itself.
     struct HUDHold: Equatable {
         var reanchoredUntil = -Double.infinity
+        var autoPausedUntil = -Double.infinity
         var overUntil = -Double.infinity
         var overLatched = false
         var joinedUntil = -Double.infinity
@@ -582,10 +645,14 @@ struct ManualTracker {
     static func hudLine(_ input: HUDInput, hold: inout HUDHold) -> String {
         if let urgent = input.urgent { return urgent }
         if input.recovering && input.pageReflowed {
-            let text = L("这页自己重新排过版了，接不回原处 · 点「接着拼」从这里开新一段，或点「完成」保存已拼好的",
-                         "This page rearranged itself and can’t rejoin the original spot. Choose Continue Here to start a new section, or Done to save what you have.")
+            let text = L("接不回原处 · 点「接着拼」从这里开新一段，或点「完成」保存已拼好的",
+                         "Can’t rejoin the original spot. Choose Continue Here to start a new section, or Done to save what you have.")
             guard input.browserTip else { return text }
             return text + L("。下次先滚完整页，等图片加载完再截。", " Next time, scroll through the page and let the images load first.")
+        }
+        if input.recovering && !input.autoScroll && input.now < hold.autoPausedUntil {
+            return L("这一段一直对不上，自动已暂停 · 可以手动往回滚一点再点自动，或点完成保存已收的部分",
+                     "This part keeps failing to line up, auto-scroll paused · scroll back a little and press Auto again, or press Done to keep what you have")
         }
         if input.recovering && input.seekingUnchangedArea {
             return L("往上滚到页面没变的地方，接上会提示", "Scroll up to an unchanged part of the page. It’ll say when it rejoins.")

@@ -965,8 +965,8 @@ enum SelfTest {
         input.pageReflowed = misses.pageReflowed
         input.wheelSeen = true
         input.distance = .offset(screens: 0.5)
-        let base = L("这页自己重新排过版了，接不回原处 · 点「接着拼」从这里开新一段，或点「完成」保存已拼好的",
-                     "This page rearranged itself and can’t rejoin the original spot. Choose Continue Here to start a new section, or Done to save what you have.")
+        let base = L("接不回原处 · 点「接着拼」从这里开新一段，或点「完成」保存已拼好的",
+                     "Can’t rejoin the original spot. Choose Continue Here to start a new section, or Done to save what you have.")
         let browserLine = ManualTracker.hudLine(input, hold: &hold)
         input.browserTip = false
         check("reflow: the localized choices replace the distance; browser advice follows the preference",
@@ -1070,38 +1070,54 @@ enum SelfTest {
 
         var stableHeader = rearranged
         stableHeader.replaceSubrange(0..<(340 * row), with: page.prefix(340 * row))
-        // One small card in the return viewport has repainted outside the locate samples.
+        // A small repaint in the returning frame scrolls out of view on the next step.
         stableHeader.replaceSubrange(88 * row..<96 * row, with: rearranged[88 * row..<96 * row])
         let rewind = Stitcher()
         for y in stride(from: 0, through: 640, by: 80) { _ = rewind.add(shot(page, y)) }
         let oldRows = rewind.canvasRows, formerCount = rewind.acceptedFrames
         let (miss, _) = rewind.addOrRejoin(shot(stableHeader, 950), at: 0)
-        let (waiting, skipped) = rewind.addOrRejoin(shot(page, 560), at: 0.12)
-        check("recovery: a throttled locate preserves the old tail until the return can be judged",
-              waiting == .lost && skipped == .skipped && rewind.needsRecovery && rewind.canvasRows == oldRows, "")
+        let waiter = Stitcher()
+        for y in stride(from: 0, through: 640, by: 80) { _ = waiter.add(shot(page, y)) }
+        _ = waiter.addOrRejoin(shot(stableHeader, 950), at: 0)
+        let (returned, skipped) = waiter.addOrRejoin(shot(page, 560), at: 0.12)
+        check("recovery: a frame in ordinary overlap rejoins even while locate is throttled",
+              returned == .shifted(-80) && skipped == .skipped && !waiter.needsRecovery && waiter.canvasRows == oldRows, "")
+        // The wheel travels away and back to the old tail. The centre is intact,
+        // but the cards on either side changed and the full viewport cannot be placed.
+        let originalTail = shot(page, 640)
+        var changedTail = shot(rearranged, 640).bytes
+        let center = 40 * row..<160 * row
+        changedTail.replaceSubrange(center, with: originalTail.bytes[center])
+        var trip = ReflowRecovery()
+        trip.wheel(at: 1.55)
+        trip.wheel(at: 0)
+        let returnShot = ReflowRecovery.Shot.wheel(trip.travel, screens: 0)
+        let tail = rewind.addOrRejoin(PixelFrame(width: width, height: height, bytes: changedTail),
+                                      wheelEstimate: 0, returnedToReference: returnShot.returnedToReference, at: 5)
+        check("recovery: recognizable tail landmarks alone cannot place a rearranged viewport",
+              tail.0 == .lost && tail.1 == .none && rewind.canvasRows == oldRows, "\(tail)")
         let (anchor, location) = rewind.addOrRejoin(shot(stableHeader, 80), at: 10)
-        let seam = 80 + height - height * 22 / 100
-        check("stable header: unique negative locate rewinds to the exact late-write seam",
+        check("stable header: a unique negative locate moves the reference and keeps the whole tail",
               miss == .lost && anchor == .first && location == .found(80 - 640)
-              && oldRows > seam && rewind.canvasRows == seam && rewind.contentOrigin == 80
+              && rewind.canvasRows == oldRows && rewind.contentOrigin == 80
               && !rewind.needsRecovery && rewind.gapFrames == 0 && rewind.acceptedFrames == formerCount + 1,
-              "locate=\(location) old=\(oldRows) cut=\(rewind.canvasRows) expected=\(seam)")
+              "locate=\(location) old=\(oldRows) rows=\(rewind.canvasRows)")
         let steps = stride(from: 160, through: 480, by: 80).map {
             rewind.addOrRejoin(shot(stableHeader, $0), at: Double($0)).0
         }
         let retaken = rewind.finish().flatMap { PixelFrame(cgImage: $0) }
         let newPixels = stableHeader.prefix((480 + height) * row)
         check("stable header: subsequent frames grow normally; export has only the new layout and no divider",
-              steps.allSatisfy { $0 == .shifted(80) } && retaken?.bytes.elementsEqual(newPixels) == true,
+              steps.allSatisfy { $0 == .shifted(80) } && rewind.rejoinTruncations == 1 && retaken?.bytes.elementsEqual(newPixels) == true,
               "steps=\(steps), final height=\(retaken?.height ?? 0)")
 
         let sameSpot = Stitcher()
         for y in [0, 80, 160, 240, 160, 80] { _ = sameSpot.add(shot(page, y)) }
         _ = sameSpot.addOrRejoin(shot(rearranged, 950), at: 0)
         let (back, exact) = sameSpot.addOrRejoin(shot(page, 80), at: 1)
-        let short = sameSpot.finish().flatMap { PixelFrame(cgImage: $0) }
-        check("stable return at zero relative distance: Done drops the stale furthest frame",
-              back == .first && exact == .found(0) && short?.bytes.elementsEqual(page.prefix(280 * row)) == true, "")
+        let saved = sameSpot.finish().flatMap { PixelFrame(cgImage: $0) }
+        check("stable return at zero relative distance: Done keeps the furthest frame",
+              back == .first && exact == .found(0) && saved?.bytes.elementsEqual(page.prefix(440 * row)) == true, "")
 
         let locked = Stitcher()
         for y in [0, 80, 160, 240] { _ = locked.add(shot(page, y)) }
@@ -1949,6 +1965,10 @@ enum SelfTest {
         check("locate applies xOffset, so a recentred earlier frame matches and an unshifted one does not",
               st.xOffset != 0 && st.lostFrames == 0 && shifted != nil && shifted! < 0 && plain == nil,
               "x=\(st.xOffset) outcomes=\(outcomes) shifted=\(shifted.map(String.init) ?? "nil") plain=\(plain.map(String.init) ?? "nil")")
+        let rows = st.canvasRows
+        let returned = st.addOrRejoin(shot(0, right: 7), wheelEstimate: -800, at: 0)
+        check("rejoin applies the measured horizontal offset and keeps the previous tail",
+              returned.1 == .found(-800) && st.canvasRows == rows && st.rejoinTruncations == 0, "\(returned)")
     }
 
     /// Mouse wheel pointDelta, poisoned-ratio samples, top/bottom absorb, overshoot recovery.

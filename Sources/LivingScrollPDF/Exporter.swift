@@ -13,6 +13,8 @@ struct CaptureRecord: Codable {
     var startedAt: Date
     var endedAt: Date
     var framesStitched: Int
+    /// Number of times a verified return replaced a divergent suffix. Absent in older projects.
+    var rejoinTruncations: Int? = nil
     /// Frames dropped because they could not be placed; the image has no seams.
     var droppedFrames: Int
     var pixelWidth: Int

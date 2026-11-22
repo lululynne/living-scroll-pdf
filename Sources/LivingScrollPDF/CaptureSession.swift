@@ -38,6 +38,8 @@ final class CaptureSession {
     private var inputMonitor: Any?
     /// A wheel, key or drag event (or an auto-scroll step) since the start: the page may have moved.
     private var inputSeen = false
+    private var edgeRequest: (edge: Stitcher.PageEdge, time: Double)?
+    private var wheelInvalidations = 0
     /// The last frame could not be joined and nothing has been joined since.
     private var recovering = false
     private var reflow = ReflowRecovery()
@@ -150,6 +152,9 @@ final class CaptureSession {
 
     private func continueHere() {
         guard recovering, reflow.pageReflowed, !isFinishing, requestedSection == nil else { return }
+        // Pin the requested position. An automatic retry could move it again or
+        // wait for a second settled frame while this one-shot request is pending.
+        if autoScroll { stopAuto() }
         acceptsFrames.withLock { $0 = false }
         requestedSection = lastStats.segment
         tick()
@@ -172,14 +177,19 @@ final class CaptureSession {
             if t.active(at: now) || recovering || hudHold.dwells(at: now) || preloadTipUntil.isFinite {
                 publishHUD(lost: false, nonzeroShift: false)
             }
-            if t.active(at: now) {
+            if t.wheelCredible && t.active(at: now) {
                 request = tracker?.capture(at: now)
                 if request == nil && !recovering { return }
             }
         }
         let auto = autoScroll
         let rawAtTake = tracker?.raw ?? 0
-        let travelAtTake = reflow.travel
+        let invalidationsAtTake = wheelInvalidations
+        let edgeAtTake = edgeRequest.flatMap { now - $0.time < 2 ? $0 : nil }
+        // The pair matcher may drop its search window after an overshoot. The wheel
+        // still measured the trip from the previous reference to this screenshot.
+        let wheelAtTake = auto ? nil : tracker.flatMap { $0.wheelCredible && $0.wheelSeen ? $0.estimate : nil }
+        let recoveryShot = reflow.snapshot(at: now, tracker: tracker, auto: auto)
         // The region follows the window if it is moved.
         config.sourceRect = displayRect()
         inFlight = true
@@ -250,22 +260,35 @@ final class CaptureSession {
             let tolerance = auto ? max(16 * stitcher.pixelScale, frame.height * 12 / 100) : (request?.tolerance ?? 0)
             let searchedAt = now
             let acceptsFrames = self.acceptsFrames
-            let (outcome, verdict, height, frames, dropped, edges, share, unjoined, segment) = await withCheckedContinuation { cont in
+            let wheelEstimate = tracker?.wheelCredible == true ? wheelAtTake : nil
+            let keyboardEdge = !auto && edgeAtTake?.time == edgeRequest?.time ? edgeAtTake?.edge : nil
+            let (outcome, verdict, height, frames, dropped, edges, share, unjoined, segment, truncated) = await withCheckedContinuation { cont in
                 work.async {
+                    let previousTruncations = stitcher.rejoinTruncations
                     let (o, verdict): (Stitcher.Outcome, Stitcher.LocateVerdict)
                     if let section {
                         (o, verdict) = (stitcher.startNewSegment(with: frame, after: section) ? .first : .lost, .skipped)
                     } else {
-                        (o, verdict) = stitcher.addOrRejoin(frame, expected: expected, tolerance: tolerance, at: searchedAt) {
+                        (o, verdict) = stitcher.addOrRejoin(frame, expected: expected, tolerance: tolerance,
+                                                           wheelEstimate: wheelEstimate, returnedToReference: recoveryShot.returnedToReference,
+                                                           keyboardEdge: keyboardEdge, at: searchedAt) {
                             acceptsFrames.withLock { $0 }
                         }
                     }
                     cont.resume(returning: (o, verdict, stitcher.capturedRows, stitcher.acceptedFrames, stitcher.lostFrames,
-                                            stitcher.edgeBands, stitcher.movingShare, stitcher.needsRecovery, stitcher.segmentStart))
+                                            stitcher.edgeBands, stitcher.movingShare, stitcher.needsRecovery, stitcher.segmentStart,
+                                            stitcher.rejoinTruncations > previousTruncations))
                 }
             }
             guard !finishing else { return }
             if !newSection && requestedSection != nil { return }
+            if edgeRequest?.time == edgeAtTake?.time {
+                switch outcome {
+                case .first: edgeRequest = nil
+                case .shifted(let distance) where distance != 0: edgeRequest = nil
+                default: break
+                }
+            }
             if newSection && outcome != .first {
                 showUrgent(L("这一帧不能开新一段 · 把窗口移回选取区域后再点「接着拼」", "Couldn’t start a section with this frame. Move the window back into the capture area and try Continue Here again."))
                 return
@@ -276,11 +299,16 @@ final class CaptureSession {
                 hudHold = ManualTracker.HUDHold()
                 if newSection { urgentStatus = nil }
                 if case .found = verdict {
-                    hudHold.reanchoredUntil = now + ManualTracker.joinedDwell
+                    hudHold.wasRecovering = true
                     preloadTipUntil = -.infinity
                     urgentStatus = nil
                     if auto { pacer = AutoPacer() }
                 }
+            }
+            if truncated {
+                hudHold.reanchoredUntil = now + ManualTracker.joinedDwell
+                preloadTipUntil = -.infinity
+                urgentStatus = nil
             }
             if ProcessInfo.processInfo.environment["JZ_TEST_OWNER"] != nil { print("frame \(dumpIndex): \(outcome)") }
             trace("frame\t\(dumpIndex)\t\(outcome)\texpected=\(expected.map(String.init) ?? "nil")\ttol=\(tolerance)\traw=\(tracker?.raw ?? 0)\tratio=\(tracker?.ratio ?? 0)\test=\(tracker?.estimate ?? 0)\tbody=\(tracker?.body ?? 0)")
@@ -295,15 +323,13 @@ final class CaptureSession {
                 tracker?.noteJudgedFrame(identical: same, at: now)
                 lastSeenFrame = frame
             }
-            if auto || !unjoined {
-                ManualTracker.dropPicture(&hudHold)
+            if invalidationsAtTake != wheelInvalidations { tracker?.invalidateWheel() }
+            if auto || !unjoined { ManualTracker.dropPicture(&hudHold) }
+            if !unjoined {
                 reflow = ReflowRecovery()
-            } else if let tracker, tracker.wheelCredible, tracker.wheelSeen {
-                if !recovering {
-                    reflow.wheel(at: rawAtTake * tracker.ratio / Double(tracker.body))
-                    reflow.wheel(at: tracker.raw * tracker.ratio / Double(tracker.body))
-                }
-                reflow.located(verdict, at: travelAtTake)
+                hudHold.autoPausedUntil = -.infinity
+            } else {
+                reflow.observe(verdict, from: recoveryShot, tracker: tracker, firstLoss: !recovering)
             }
             // Manual mode: the seam line and overlap limits follow the part of the view that scrolls.
             if case .shifted(let d) = outcome, d != 0 { tracker?.body = max(64, Int((Double(frame.height) * share).rounded())) }
@@ -321,7 +347,8 @@ final class CaptureSession {
                 scrollOnce(by: fraction)
             case .pause:
                 stopAuto()
-                showUrgent(L("这一段一直对不上，自动已暂停 · 可以手动往回滚一点再点自动，或点完成保存已收的部分", "This part keeps failing to line up, auto-scroll paused · scroll back a little and press Auto again, or press Done to keep what you have"))
+                hudHold.autoPausedUntil = now + 4
+                publishHUD(lost: true, nonzeroShift: false)
             case .finish:
                 showUrgent(L("到底了，正在生成…", "Reached the end, saving…"))
                 finish()
@@ -395,13 +422,14 @@ final class CaptureSession {
                 let region = self.sourceRect.offsetBy(dx: frame.minX, dy: frame.minY)
                 guard region.contains(point), WindowList.frontmost(at: point)?.id == self.pick.windowID else { return }
                 self.noteInput()
+                self.edgeRequest = nil
                 self.tracker?.wheel(deltaY: dy, precise: precise, at: self.now, pointDelta: pointDelta)
                 self.traceWheel(e0: rawDelta, dy: dy, precise: precise, pointDelta: pointDelta)
                 // Distance figures follow the wheel itself, not the next captured frame.
                 // `.over` does too: the dwell starts when the wheel crosses the line.
                 if let t = self.tracker {
                     if self.recovering && t.wheelCredible {
-                        self.reflow.wheel(at: t.raw * t.ratio / Double(t.body))
+                        self.reflow.wheel(at: t.wheelScreens)
                     }
                     let tooFar: Bool
                     if case .over = t.gauge { tooFar = true } else { tooFar = false }
@@ -413,15 +441,36 @@ final class CaptureSession {
         }
         // Keys (arrows, space, page down) and dragging a scroll bar move pages without the wheel.
         // Any of them counts, wherever it happens: wrongly assuming a move only costs leniency.
-        inputMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .leftMouseDragged]) { [weak self] _ in
+        inputMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .leftMouseDragged]) { [weak self] event in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.noteInput()
-                self.tracker?.invalidateWheel()
-                if !self.reflow.pageReflowed { self.reflow = ReflowRecovery() }
+                self.invalidateWheel()
+                if event.type == .keyDown, let edge = Self.pageEdge(for: event),
+                   NSWorkspace.shared.frontmostApplication?.processIdentifier == self.pick.pid,
+                   WindowList.onScreen().first(where: { $0.pid == self.pick.pid })?.id == self.pick.windowID {
+                    self.edgeRequest = (edge, self.now)
+                }
                 if self.recovering { self.publishHUD(lost: false, nonzeroShift: false) }
             }
         }
+    }
+
+    private static func pageEdge(for event: NSEvent) -> Stitcher.PageEdge? {
+        switch event.specialKey {
+        case .home: return .start
+        case .end: return .end
+        case .upArrow where event.modifierFlags.contains(.command): return .start
+        case .downArrow where event.modifierFlags.contains(.command): return .end
+        default: return nil
+        }
+    }
+
+    private func invalidateWheel() {
+        wheelInvalidations &+= 1
+        edgeRequest = nil
+        tracker?.invalidateWheel()
+        reflow.invalidateWheel()
     }
 
     /// Diagnostic log next to JZ_DUMP frames: one line per wheel event and per judged frame.
@@ -451,6 +500,7 @@ final class CaptureSession {
     private static let autoModeAvailable = false
 
     private func toggleAuto() {
+        guard requestedSection == nil else { return }
         if autoScroll {
             stopAuto()
             return
@@ -467,6 +517,8 @@ final class CaptureSession {
         bringTargetToFront()
         CGWarpMouseCursorPosition(scrollPoint())
         autoScroll = true
+        invalidateWheel()
+        hudHold.autoPausedUntil = -.infinity
         pacer = AutoPacer()
         settler.reset()
         hud.setAuto(true)
@@ -474,6 +526,7 @@ final class CaptureSession {
     }
 
     private func stopAuto() {
+        if autoScroll { invalidateWheel() }
         autoScroll = false
         hud.setAuto(false)
     }
@@ -561,6 +614,7 @@ final class CaptureSession {
                     var rec = base
                     rec.framesStitched = stitcher.acceptedFrames
                     rec.droppedFrames = stitcher.lostFrames
+                    rec.rejoinTruncations = stitcher.rejoinTruncations
                     // A frame that cannot be placed stays out of the image. A later frame is
                     // written only when the overlap proves those rows continue; a similar
                     // match that cannot be proved is left unjoined, so lines that were never
