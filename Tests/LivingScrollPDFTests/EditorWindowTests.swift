@@ -78,14 +78,84 @@ final class EditorWindowTests: XCTestCase {
         field.stringValue = "Trip"
         editor.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: field))
         try await waitFor("autosave keeps the chosen partial name") { try library.entries().first?.name == "Trip" }
-        var exported: URL?
-        editor.showExportedFiles = { exported = $0 }
+        var selections: [[URL]] = []
+        editor.showExportedFiles = { selections.append($0) }
         let button = try XCTUnwrap(views.compactMap { $0 as? NSButton }.first { $0.title == EditorCopy.export })
         XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(button.action), to: button.target, from: button))
-        try await waitFor("export finishes") { exported != nil && !editor.isBusy }
+        try await waitFor("export finishes") { !selections.isEmpty && !editor.isBusy }
         XCTAssertEqual(field.stringValue, "Trip")
-        XCTAssertEqual(exported?.lastPathComponent, "Trip.pdf")
+        let files = ["Trip.png", "Trip.pdf"].map { library.outputFolder.appendingPathComponent($0) }
+        XCTAssertEqual(selections, [files])
         XCTAssertTrue(try library.load(initial.document.id).document.record.isPartial)
+        XCTAssertEqual(button.title, L("导出（PNG + PDF）", "Export (PNG + PDF)"))
+        let sheet = try XCTUnwrap(NSApp.windows.first { $0.sheetParent === window })
+        let notice = descendants(try XCTUnwrap(sheet.contentView))
+        let labels = notice.compactMap { ($0 as? NSTextField)?.stringValue }
+        XCTAssertTrue(labels.contains(L("已存好 PNG 和 PDF 各一份", "Saved one PNG and one PDF")))
+        XCTAssertTrue(labels.contains((library.outputFolder.path as NSString).abbreviatingWithTildeInPath))
+        let titles = notice.compactMap { ($0 as? NSButton)?.title }
+        XCTAssertTrue(titles.contains(L("打开文件夹", "Open Folder")))
+        XCTAssertTrue(titles.contains(L("好", "OK")))
+        window.endSheet(sheet, returnCode: .alertSecondButtonReturn)
+        try await waitFor("Open Folder selects the same two files again") { selections == [files, files] }
+    }
+
+    @MainActor func testRedactedExportShowsActualFallbackPathAndKeepsPrivateOriginalNotice() async throws {
+        try await checkRedactedExport(readOnlyIndex: false)
+    }
+
+    @MainActor func testRedactedExportExplainsSavedOriginalWhenRecordingTheExportFails() async throws {
+        try await checkRedactedExport(readOnlyIndex: true)
+    }
+
+    @MainActor private func checkRedactedExport(readOnlyIndex: Bool) async throws {
+        _ = NSApplication.shared
+        let fm = FileManager.default, root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: root) }
+        let chosen = root.appendingPathComponent("Removable", isDirectory: true)
+        try fm.createDirectory(at: chosen, withIntermediateDirectories: true)
+        let fallback = root.appendingPathComponent("Desktop/卷轴PDF", isDirectory: true)
+        let privateRoot = root.appendingPathComponent("Library")
+        let library = ScrollLibrary(root: privateRoot) {
+            ExportDestination(defaultFolder: fallback, customFolder: chosen)
+        }
+        let defaults = UserDefaults.standard, key = "explainedPrivateRedactionOriginal"
+        let previous = defaults.object(forKey: key)
+        defaults.removeObject(forKey: key)
+        defer { defaults.set(previous, forKey: key) }
+
+        let (image, record) = try capture()
+        var draft = EditDocument(name: "Redacted", record: record)
+        draft.layers = [EditLayer(kind: .mosaic, rect: CGRect(x: 2, y: 2, width: 32, height: 32))]
+        let document = try library.save(draft, original: image, categoryID: nil)
+        if readOnlyIndex { try fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: privateRoot.path) }
+        defer { if readOnlyIndex { try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: privateRoot.path) } }
+        let editor = EditorWindow(document: document, original: image, categoryID: nil, saved: true, library: library)
+        let window = try XCTUnwrap(editor.window)
+        defer { window.close() }
+        let views = descendants(try XCTUnwrap(window.contentView))
+        let button = try XCTUnwrap(views.compactMap { $0 as? NSButton }.first { $0.title == EditorCopy.export })
+        var selections: [[URL]] = []
+        editor.showExportedFiles = { selections.append($0) }
+        try fm.removeItem(at: chosen)
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(button.action), to: button.target, from: button))
+        try await waitFor("redacted pair revealed") { !selections.isEmpty && !editor.isBusy }
+        let files = ["Redacted.png", "Redacted.pdf"].map { fallback.appendingPathComponent($0) }
+        XCTAssertEqual(selections, [files])
+        let sheet = try XCTUnwrap(NSApp.windows.first { $0.sheetParent === window })
+        let labels = descendants(try XCTUnwrap(sheet.contentView)).compactMap { ($0 as? NSTextField)?.stringValue }
+        XCTAssertTrue(labels.contains(EditorCopy.exported))
+        let body = try XCTUnwrap(labels.first { $0.hasPrefix(ExportUI.path(fallback)) })
+        let expected = [ExportUI.path(fallback), EditorCopy.desktopFallback("卷轴PDF"),
+                        EditorCopy.redactionExported, EditorCopy.privateOriginalNotice].joined(separator: "\n")
+        if readOnlyIndex { XCTAssertTrue(body.hasPrefix(expected + "\n" + EditorCopy.exportedWithoutLibrary)) }
+        else { XCTAssertEqual(body, expected) }
+        XCTAssertTrue(defaults.bool(forKey: key))
+        // Reconnecting the chosen disk must not change which files Open Folder reveals.
+        try fm.createDirectory(at: chosen, withIntermediateDirectories: false)
+        window.endSheet(sheet, returnCode: .alertSecondButtonReturn)
+        try await waitFor("the button reveals the actual fallback pair") { selections == [files, files] }
+        XCTAssertNotNil(try library.load(document.id).original)
     }
 
     @MainActor func testLibraryChangesReachAnOpenEditorAndSurviveItsNextAutosave() async throws {
@@ -143,12 +213,14 @@ final class EditorWindowTests: XCTestCase {
         canvas.tool = .pen
         canvas.beginInteraction(at: CGPoint(x: 30, y: 50))
         canvas.endInteraction(at: CGPoint(x: 150, y: 50))
-        var published: URL?
+        var published: [URL]?
         editor.showExportedFiles = { published = $0 }
         let export = try XCTUnwrap(views.compactMap { $0 as? NSButton }.first { $0.title == EditorCopy.export })
         XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(export.action), to: export.target, from: export))
         try await waitFor("export completed independently of the library") { published != nil && !editor.isBusy }
-        let pdf = try XCTUnwrap(published)
+        let files = try XCTUnwrap(published)
+        XCTAssertEqual(files.map(\.pathExtension), ["png", "pdf"])
+        let pdf = try XCTUnwrap(files.last)
         XCTAssertNotNil(CGPDFDocument(pdf as CFURL)?.page(at: 1))
         let stem = pdf.deletingPathExtension()
         let data = try Data(contentsOf: stem.appendingPathExtension("json"))

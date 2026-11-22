@@ -48,26 +48,29 @@ final class ScrollLibrary {
     }
 
     static let shared: ScrollLibrary = {
-        let folders = Exporter.outputFolders
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return ScrollLibrary(outputFolder: folders[0], root: support.appendingPathComponent("LivingScrollPDF/Library", isDirectory: true),
-                             legacyOutputFolders: folders)
+        return ScrollLibrary(root: support.appendingPathComponent("LivingScrollPDF/Library", isDirectory: true))
     }()
 
-    let outputFolder: URL
+    private let resolveExportDestination: () -> ExportDestination
+    var exportDestination: ExportDestination { resolveExportDestination() }
+    var outputFolder: URL { exportDestination.folder }
+    var legacyOutputFolders: [URL] { exportDestination.legacyFolders }
     private let root: URL
-    let legacyOutputFolders: [URL]
     private let preparationLock = NSLock()
     private var storageReady = false
     private var migrationComplete = false
     private var indexURL: URL { root.appendingPathComponent("index.json") }
     private let fm = FileManager.default
 
-    init(outputFolder: URL, root: URL, legacyOutputFolders: [URL]? = nil) {
-        self.outputFolder = outputFolder
+    init(root: URL, exportDestination: @escaping () -> ExportDestination = { .current() }) {
         self.root = root
-        var paths = Set<String>()
-        self.legacyOutputFolders = (legacyOutputFolders ?? [outputFolder]).filter { paths.insert($0.standardizedFileURL.path).inserted }
+        self.resolveExportDestination = exportDestination
+    }
+
+    convenience init(outputFolder: URL, root: URL, legacyOutputFolders: [URL]? = nil) {
+        let destination = ExportDestination(defaultFolder: outputFolder, legacyFolders: legacyOutputFolders ?? [outputFolder])
+        self.init(root: root, exportDestination: { destination })
     }
 
     private struct Index: Codable {

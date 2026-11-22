@@ -38,6 +38,7 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
     private let table = LibraryTableView()
     private let empty = NSTextField(wrappingLabelWithString: "")
     private let importButton = NSButton()
+    private lazy var locationButton = NSButton(title: "", target: self, action: #selector(chooseExportLocation))
     private let openButton = NSButton()
     private let deleteButton = NSButton()
     private let spinner = NSProgressIndicator()
@@ -91,11 +92,12 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
         search.sendsSearchStringImmediately = true
         search.delegate = self
         let space = NSView()
-        let bar = NSStackView(views: [categoryPicker, manage, space, search])
+        let bar = NSStackView(views: [categoryPicker, manage, space, locationButton, search])
         bar.spacing = 6
         bar.alignment = .centerY
         space.setContentHuggingPriority(.defaultLow, for: .horizontal)
         categoryPicker.widthAnchor.constraint(lessThanOrEqualToConstant: 210).isActive = true
+        categoryPicker.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         search.widthAnchor.constraint(equalToConstant: 208).isActive = true
 
         for (key, width, minWidth) in [
@@ -198,6 +200,7 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
             table.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier(key))?.title = label
         }
         importButton.title = L("打开已有 PNG…", "Open Existing PNG…")
+        locationButton.title = EditorCopy.exportLocation
         openButton.title = L("继续编辑", "Continue Editing")
         deleteButton.title = EditorCopy.deleteCapture
     }
@@ -536,6 +539,11 @@ final class LibraryWindow: NSWindowController, NSTableViewDataSource, NSTableVie
             } catch { showError(error) }
             refresh()
         }
+    }
+
+    @objc private func chooseExportLocation() {
+        guard let window else { return }
+        ExportUI.chooseLocation(startingAt: library.outputFolder, for: window)
     }
 
     @objc private func importPNG() {

@@ -75,19 +75,8 @@ enum Exporter {
     /// 200 inches: the largest page Acrobat and most viewers accept.
     static let maxPagePoints = 14_400
 
-    static var outputFolder: URL { outputFolders[0] }
-
-    /// Keep a capture's public filename stable across language changes and relaunches.
-    /// Both historical names are still checked for interrupted exports and old libraries.
-    static var outputFolders: [URL] {
-        if let custom = ProcessInfo.processInfo.environment["JZ_OUT"] { return [URL(fileURLWithPath: custom, isDirectory: true)] }
-        let desktop = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop", isDirectory: true)
-        let defaults = UserDefaults.standard, key = "desktopExportFolderName"
-        let saved = defaults.string(forKey: key)
-        let folders = desktopFolders(in: desktop, preferredName: L("卷轴PDF", "Living Scroll PDF"), savedName: saved)
-        if saved != folders[0].lastPathComponent { defaults.set(folders[0].lastPathComponent, forKey: key) }
-        return folders
-    }
+    static var outputFolder: URL { ExportDestination.current().folder }
+    static var outputFolders: [URL] { ExportDestination.current().recoveryFolders }
 
     static func desktopFolders(in desktop: URL, preferredName: String, savedName: String?) -> [URL] {
         let folders = ["Living Scroll PDF", "卷轴PDF"].map { desktop.appendingPathComponent($0, isDirectory: true) }
@@ -131,13 +120,18 @@ enum Exporter {
     }
 
     /// Encode all of the new products before replacing any public file.
-    static func export(_ image: CGImage, record: CaptureRecord, folder: URL = outputFolder,
+    static func export(_ image: CGImage, record: CaptureRecord, folder: URL,
                        name: String? = nil, layers: [EditLayer] = [], layout: PDFLayout = pdfLayout,
                        legacyFolders: [URL] = []) throws -> URL {
+        try export(image, record: record, to: ExportDestination(defaultFolder: folder, legacyFolders: legacyFolders),
+                   name: name, layers: layers, layout: layout).pdf
+    }
+
+    static func export(_ image: CGImage, record: CaptureRecord, to destination: ExportDestination,
+                       name: String? = nil, layers: [EditLayer] = [], layout: PDFLayout = pdfLayout) throws -> ExportedFiles {
+        destination.pendingExports?.recoverAvailable()
         let stem = fileStem(for: record, name: name)
-        let destination = ExportPublication.previousFolder(for: record.editingProjectID, stem: stem,
-                                                          preferred: folder, legacyFolders: legacyFolders)
-        return try ExportPublication.write(in: destination, stem: stem, projectID: record.editingProjectID) { png, pdf, json in
+        let render = { (png: URL, pdf: URL, json: URL) throws in
             let pages = try BandedExport.write(original: image, layers: layers, record: record,
                                                layout: layout, png: png, pdf: pdf)
             var published = record
@@ -150,10 +144,28 @@ enum Exporter {
             encoder.dateEncodingStrategy = .iso8601
             try encoder.encode(published).write(to: json)
         }
+
+        let folder: URL
+        if destination.customFolder != nil {
+            // Even after the preflight, a removable disk can disappear or refuse the actual write.
+            // Retry the whole transaction on Desktop, retaining the chosen path for its next mount.
+            if let chosen = destination.usableCustomFolder,
+               let pdf = try? ExportPublication.write(in: chosen, createFolder: false, tracking: destination.pendingExports, stem: stem,
+                                                      projectID: record.editingProjectID, render: render) {
+                return ExportedFiles(pdf: pdf, usedDesktopFallback: false)
+            }
+            folder = destination.defaultFolder
+        } else {
+            folder = ExportPublication.previousFolder(for: record.editingProjectID, stem: stem,
+                                                      preferred: destination.defaultFolder, legacyFolders: destination.legacyFolders)
+        }
+        let pdf = try ExportPublication.write(in: folder, stem: stem, projectID: record.editingProjectID, render: render)
+        let unfinished = destination.customFolder.map { destination.pendingExports?.entries.values.contains($0) == true } ?? false
+        return ExportedFiles(pdf: pdf, usedDesktopFallback: destination.customFolder != nil, unfinishedAtCustomFolder: unfinished)
     }
 
     static func recoverPendingExport(in folder: URL) throws {
-        try ExportPublication.recoverPending(in: folder)
+        _ = try ExportPublication.recoverPending(in: folder)
     }
 
     /// Hex-encoded UTF-16BE is a PDF text string even for emoji, CJK, or literal delimiters.
@@ -210,6 +222,33 @@ enum Exporter {
             case .cannotCreate(let url): return L("无法写入 \(url.path)", "Could not write \(url.path)")
             case .interrupted(let url): return L("中断导出的剩余文件保存在 \(url.path)", "The remaining files from the interrupted export are in \(url.path)")
             }
+        }
+    }
+}
+
+/// Each ready transaction gets its own key. A later export or another process can
+/// finish one generation without clearing a newer writer's recovery location.
+struct PendingCustomExports {
+    let defaults: UserDefaults
+    private let prefix = "pendingCustomExport."
+
+    var entries: [String: URL] {
+        var result: [String: URL] = [:]
+        for (key, value) in defaults.dictionaryRepresentation() where key.hasPrefix(prefix) {
+            if let path = value as? String { result[key] = URL(fileURLWithPath: path, isDirectory: true) }
+        }
+        return result
+    }
+
+    func remember(_ folder: URL) -> String {
+        let key = prefix + UUID().uuidString
+        defaults.set(folder.path, forKey: key)
+        return key
+    }
+
+    func recoverAvailable() {
+        for (key, folder) in entries {
+            if (try? ExportPublication.recoverPending(in: folder)) == true { defaults.removeObject(forKey: key) }
         }
     }
 }
@@ -278,21 +317,21 @@ private enum ExportPublication {
         return (try? existingDestination(named: stem, in: preferred, projectID: id)) == nil ? legacy : preferred
     }
 
-    static func write(in folder: URL, stem: String, projectID: UUID?,
+    static func write(in folder: URL, createFolder: Bool = true, tracking: PendingCustomExports? = nil, stem: String, projectID: UUID?,
                       render: (URL, URL, URL) throws -> Void) throws -> URL {
-        let fm = FileManager.default
-        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        if createFolder { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
         return try withOutputLock(in: folder) {
             let stage = stagingDirectory(in: folder)
             do { try recover(stage: stage, in: folder) }
             catch Exporter.ExportError.interrupted { /* The incomplete v1 set has been kept separately. */ }
-            return try write(stem: stem, projectID: projectID, in: folder, stage: stage, render: render)
+            return try write(stem: stem, projectID: projectID, in: folder, stage: stage, tracking: tracking, render: render)
         }
     }
 
-    static func recoverPending(in folder: URL) throws {
-        guard try attributes(of: folder) != nil else { return }
+    static func recoverPending(in folder: URL) throws -> Bool {
+        guard try attributes(of: folder) != nil else { return false }
         try withOutputLock(in: folder) { try recover(stage: stagingDirectory(in: folder), in: folder) }
+        return true
     }
 
     private static func withOutputLock<T>(in folder: URL, _ action: () throws -> T) throws -> T {
@@ -310,7 +349,7 @@ private enum ExportPublication {
     }
 
     private static func write(stem: String, projectID: UUID?, in folder: URL, stage: URL,
-                              render: (URL, URL, URL) throws -> Void) throws -> URL {
+                              tracking: PendingCustomExports?, render: (URL, URL, URL) throws -> Void) throws -> URL {
         let fm = FileManager.default
         try fm.createDirectory(at: stage, withIntermediateDirectories: false,
                                attributes: [.posixPermissions: 0o700])
@@ -331,6 +370,7 @@ private enum ExportPublication {
         }
         try Data(stem.utf8).write(to: stage.appendingPathComponent(target.stem + ".ready"))
         prepared = true
+        let pendingKey = tracking?.remember(folder)
         let publishedStem: String
         do {
             try publish(stage: stage, target: target, folder: folder)
@@ -339,6 +379,7 @@ private enum ExportPublication {
             publishedStem = try resumePublication(stem: target.stem, stage: stage, folder: folder)
         }
         try discard(stage: stage, in: folder)
+        if let pendingKey { tracking?.defaults.removeObject(forKey: pendingKey) }
         return folder.appendingPathComponent(publishedStem + ".pdf")
     }
 

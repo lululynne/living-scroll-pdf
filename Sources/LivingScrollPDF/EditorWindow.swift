@@ -45,10 +45,7 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     private var activeSave: Task<EditDocument, Error>?
     private var localizeChrome: (() -> Void)?
     var onClose: (() -> Void)?
-    var showExportedFiles: (URL) -> Void = { pdf in
-        NSWorkspace.shared.activateFileViewerSelecting([pdf])
-        NSWorkspace.shared.open(pdf)
-    }
+    var showExportedFiles: ([URL]) -> Void = ExportUI.reveal
 
     init(document: EditDocument, original: CGImage, categoryID: UUID?, saved: Bool, library: ScrollLibrary = .shared) {
         self.library = library
@@ -584,35 +581,31 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
             } catch { libraryProblem = error }
 
             let stored = document, original = self.original, library = self.library
-            var published: URL?
+            var published: ExportedFiles?
             var exportProblem: Error?
             if export {
                 do {
-                    let pdf = try await Task.detached(priority: .userInitiated) {
-                        try EditorExport.write(stored, original: original, folder: library.outputFolder,
-                                               legacyFolders: library.legacyOutputFolders)
+                    let result = try await Task.detached(priority: .userInitiated) {
+                        try EditorExport.write(stored, original: original, to: library.exportDestination)
                     }.value
-                    published = pdf
+                    published = result
                     if libraryProblem == nil {
-                        do { try await Task.detached { try library.recordExport(pdf, for: stored.id) }.value }
+                        do { try await Task.detached { try library.recordExport(result.pdf, for: stored.id) }.value }
                         catch { libraryProblem = error }
                     }
                 } catch { exportProblem = error }
             }
+            let redacted = published != nil && stored.layers.contains { $0.kind == .mosaic }
+            var hasPrivateOriginal = libraryProblem == nil
+            if redacted, !hasPrivateOriginal {
+                // Recording the exported name can fail even though the original was saved.
+                hasPrivateOriginal = await Task.detached { (try? library.originalURL(for: stored.id)) != nil }.value
+            }
             window.endSheet(progress)
             isBusy = false
             if let published {
-                showExportedFiles(published)
-                if let libraryProblem {
-                    showError(libraryProblem.localizedDescription, title: EditorCopy.exportedWithoutLibrary)
-                } else if stored.layers.contains(where: { $0.kind == .mosaic }),
-                          !UserDefaults.standard.bool(forKey: "explainedPrivateRedactionOriginal") {
-                    UserDefaults.standard.set(true, forKey: "explainedPrivateRedactionOriginal")
-                    let notice = NSAlert()
-                    notice.messageText = EditorCopy.redactionExported
-                    notice.informativeText = EditorCopy.privateOriginalNotice
-                    notice.beginSheetModal(for: window, completionHandler: nil)
-                }
+                showExportNotice(published, redacted: redacted, hasPrivateOriginal: hasPrivateOriginal,
+                                 libraryProblem: libraryProblem, in: window)
                 completion?(true)
             } else if let exportProblem {
                 let message = [exportProblem.localizedDescription, libraryProblem?.localizedDescription]
@@ -626,6 +619,32 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
                 completion?(true)
             }
         }
+    }
+
+    private func showExportNotice(_ result: ExportedFiles, redacted: Bool, hasPrivateOriginal: Bool,
+                                  libraryProblem: Error?, in window: NSWindow) {
+        let notice = NSAlert()
+        notice.messageText = EditorCopy.exported
+        var lines = [ExportUI.locationText(result)]
+        if redacted {
+            lines.append(EditorCopy.redactionExported)
+            if hasPrivateOriginal, !UserDefaults.standard.bool(forKey: "explainedPrivateRedactionOriginal") {
+                lines.append(EditorCopy.privateOriginalNotice)
+                UserDefaults.standard.set(true, forKey: "explainedPrivateRedactionOriginal")
+            }
+        }
+        if let libraryProblem {
+            notice.alertStyle = .warning
+            lines.append(EditorCopy.exportedWithoutLibrary + " " + libraryProblem.localizedDescription)
+        }
+        notice.informativeText = lines.joined(separator: "\n")
+        notice.addButton(withTitle: L("好", "OK"))
+        notice.addButton(withTitle: EditorCopy.openFolder)
+        let files = result.files, reveal = showExportedFiles
+        notice.beginSheetModal(for: window) { response in
+            if response == .alertSecondButtonReturn { reveal(files) }
+        }
+        reveal(files)
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -719,12 +738,15 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
 /// All export surfaces use one flattened raster. In particular a redacted PDF
 /// contains no selectable text or original image hidden beneath a mosaic.
 enum EditorExport {
-    static func write(_ document: EditDocument, original: CGImage, folder: URL = Exporter.outputFolder,
+    static func write(_ document: EditDocument, original: CGImage, folder: URL,
                       legacyFolders: [URL] = []) throws -> URL {
+        try write(document, original: original, to: ExportDestination(defaultFolder: folder, legacyFolders: legacyFolders)).pdf
+    }
+
+    static func write(_ document: EditDocument, original: CGImage, to destination: ExportDestination = .current()) throws -> ExportedFiles {
         var record = document.record
         record.editingProjectID = document.id
         record.editLayerCount = document.layers.count
-        return try Exporter.export(original, record: record, folder: folder, name: document.name,
-                                   layers: document.layers, legacyFolders: legacyFolders)
+        return try Exporter.export(original, record: record, to: destination, name: document.name, layers: document.layers)
     }
 }

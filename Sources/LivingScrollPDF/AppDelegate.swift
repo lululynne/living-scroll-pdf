@@ -2,7 +2,7 @@ import AppKit
 import Carbon
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static private(set) weak var shared: AppDelegate?
 
     private var statusItem: NSStatusItem!
@@ -34,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let failures = await Task.detached {
                 let library = ScrollLibrary.shared
                 var failures: [String] = []
+                library.exportDestination.pendingExports?.recoverAvailable()
                 for folder in Exporter.outputFolders {
                     do { try Exporter.recoverPendingExport(in: folder) }
                     catch { failures.append(EditorCopy.unfinishedExport + " " + error.localizedDescription) }
@@ -77,15 +78,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildMenu() {
             let menu = NSMenu()
+            menu.delegate = self
             let start = NSMenuItem(title: L("开始截取（⌃⌥S）", "Start Capture (⌃⌥S)"), action: #selector(startCapture), keyEquivalent: "")
             start.target = self
             menu.addItem(start)
             let library = NSMenuItem(title: EditorCopy.library, action: #selector(showLibrary), keyEquivalent: "")
             library.target = self
             menu.addItem(library)
-            let folder = NSMenuItem(title: L("打开输出文件夹", "Open Output Folder"), action: #selector(openFolder), keyEquivalent: "")
+            let choose = menu.addItem(withTitle: EditorCopy.exportLocation, action: #selector(chooseExportLocation), keyEquivalent: "")
+            choose.target = self
+            let folder = NSMenuItem(title: "", action: #selector(openFolder), keyEquivalent: "")
             folder.target = self
             menu.addItem(folder)
+            let reset = menu.addItem(withTitle: "", action: #selector(restoreExportLocation), keyEquivalent: "")
+            reset.target = self
             let layout = NSMenuItem(title: L("PDF 页面", "PDF Pages"), action: nil, keyEquivalent: "")
             let layouts = NSMenu()
             for (title, value) in [(L("一整页长 PDF（和长图一样，没有分页缝）", "One Long Page (seamless, like the image)"), Exporter.PDFLayout.long), (L("按 A4 分页（方便打印）", "A4 Pages (for printing)"), .a4)] {
@@ -136,7 +142,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
             menu.addItem(NSMenuItem(title: L("退出卷轴PDF", "Quit Living Scroll PDF"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
             statusItem.menu = menu
+        menuNeedsUpdate(menu)
         statusItem.button?.toolTip = L("卷轴PDF · 滚动长截图存 PDF", "Living Scroll PDF · scrolling capture to PDF")
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard let item = menu.items.first(where: { $0.action == #selector(openFolder) }) else { return }
+        let path = ExportUI.path(ScrollLibrary.shared.outputFolder)
+        item.title = L("打开输出文件夹（\(path)）", "Open Output Folder (\(path))")
+        item.toolTip = path
+        let name = ExportDestination.savedDesktopName() ?? L("卷轴PDF", "Living Scroll PDF")
+        menu.items.first { $0.action == #selector(restoreExportLocation) }?.title =
+            L("恢复默认（桌面『\(name)』）", "Restore Default (“\(name)” on Desktop)")
     }
 
     @objc private func chooseLanguage(_ sender: NSMenuItem) {
@@ -283,9 +300,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openMail() { NSWorkspace.shared.open(Links.mail) }
 
+    @objc private func chooseExportLocation() {
+        ExportUI.chooseLocation(startingAt: ScrollLibrary.shared.outputFolder)
+    }
+
+    @objc private func restoreExportLocation() { ExportDestination.setCustomFolder(nil) }
+
     @objc private func openFolder() {
-        let url = ScrollLibrary.shared.outputFolder
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        let destination = ScrollLibrary.shared.exportDestination, url = destination.folder
+        if url == destination.defaultFolder { try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true) }
         NSWorkspace.shared.open(url)
     }
 

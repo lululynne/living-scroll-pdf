@@ -34,7 +34,13 @@ enum EditorCopy {
     static var categoryName: String { L("分类名称", "Category name") }
     static var create: String { L("创建", "Create") }
     static var save: String { L("保存", "Save") }
-    static var export: String { L("导出 PNG 和 PDF", "Export PNG & PDF") }
+    static var export: String { L("导出（PNG + PDF）", "Export (PNG + PDF)") }
+    static var exportLocation: String { L("导出位置…", "Export Location…") }
+    static var openFolder: String { L("打开文件夹", "Open Folder") }
+    static var exported: String { L("已存好 PNG 和 PDF 各一份", "Saved one PNG and one PDF") }
+    static func desktopFallback(_ name: String) -> String {
+        L("原来选的文件夹找不到了，这次存到了桌面『\(name)』", "The chosen folder is unavailable. This export was saved to “\(name)” on your Desktop.")
+    }
     static var saving: String { L("正在保存…", "Saving…") }
     static var exporting: String { L("正在导出…", "Exporting…") }
     static var saved: String { L("已保存到我的长截图", "Saved to My Screenshots") }
@@ -43,7 +49,7 @@ enum EditorCopy {
     static var libraryUnavailable: String { L("检查「我的长截图」时遇到问题。", "My Screenshots needs attention.") }
     static var unfinishedExport: String { L("未能恢复上次导出。", "Couldn’t finish the previous export.") }
     static var exportedWithoutLibrary: String { L("文件已导出，图库未更新", "Files exported. The library could not be updated.") }
-    static var redactionExported: String { L("已导出打码后的 PNG 和 PDF", "Redacted PNG and PDF exported") }
+    static var redactionExported: String { L("这两份文件都已打码。", "Both files are redacted.") }
     static var privateOriginalNotice: String { L("未打码的原图保存在本机的「我的长截图」。选中截图，点「删除截图」即可删除原图和编辑记录。", "The unredacted original is in My Screenshots on this Mac. Select the capture and choose Delete Screenshot to remove its original and edits.") }
     static var deleteCapture: String { L("删除截图", "Delete Screenshot") }
     static func confirmDeleteCapture(_ name: String) -> String { L("删除「\(name)」？", "Delete “\(name)”?") }

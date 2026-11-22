@@ -411,6 +411,61 @@ final class EditorExportTests: XCTestCase {
         XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: link.path), similar.path)
     }
 
+    func testReconnectedFolderFinishesItsInterruptedPairAfterChoosingAnotherLocation() throws {
+        let fm = FileManager.default, root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let suite = "ExportRecoveryTests." + UUID().uuidString, defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite); try? fm.removeItem(at: root) }
+        let first = root.appendingPathComponent("Removable", isDirectory: true)
+        let next = root.appendingPathComponent("Next", isDirectory: true)
+        let offline = root.appendingPathComponent("Disconnected", isDirectory: true)
+        func destination() -> ExportDestination {
+            .current(defaults: defaults, environment: [:], desktop: root.appendingPathComponent("Desktop", isDirectory: true))
+        }
+        func chmod(_ arguments: [String]) throws {
+            let tool = try Process.run(URL(fileURLWithPath: "/bin/chmod"), arguments: arguments)
+            tool.waitUntilExit()
+            XCTAssertEqual(tool.terminationStatus, 0)
+        }
+        try fm.createDirectory(at: first, withIntermediateDirectories: true)
+        try fm.createDirectory(at: next, withIntermediateDirectories: true)
+        ExportDestination.setCustomFolder(first, defaults: defaults)
+        let image = try stripedOriginal()
+        var doc = EditDocument(name: "Receipt", record: fixtureRecord())
+        let old = try EditorExport.write(doc, original: image, to: destination())
+        let oldPNGHash = try Exporter.sha256(of: old.png), oldPDFHash = try Exporter.sha256(of: old.pdf)
+        // Only the PDF replacement is denied. PNG has already been published when the swap fails.
+        try chmod(["+a", "everyone deny delete", old.pdf.path])
+        defer {
+            let file = fm.fileExists(atPath: old.pdf.path) ? old.pdf : offline.appendingPathComponent("Receipt.pdf")
+            try? chmod(["-N", file.path])
+        }
+        doc.layers = [EditLayer(kind: .mosaic, rect: CGRect(x: 0, y: 0, width: 64, height: 64))]
+        let redacted = try EditorExport.write(doc, original: image, to: destination())
+        XCTAssertTrue(redacted.usedDesktopFallback)
+        XCTAssertTrue(redacted.unfinishedAtCustomFolder)
+        XCTAssertEqual(redacted.folder, destination().defaultFolder)
+        XCTAssertTrue(redacted.files.allSatisfy { fm.fileExists(atPath: $0.path) })
+        XCTAssertNotEqual(try Exporter.sha256(of: old.png), oldPNGHash)
+        XCTAssertEqual(try Exporter.sha256(of: old.pdf), oldPDFHash)
+        try fm.moveItem(at: first, to: offline)
+
+        ExportDestination.setCustomFolder(next, defaults: defaults)
+        let tracking = PendingCustomExports(defaults: defaults)
+        XCTAssertEqual(try EditorExport.write(doc, original: image, to: destination()).folder, next)
+        XCTAssertEqual(Array(tracking.entries.values), [first])
+        XCTAssertFalse(fm.fileExists(atPath: first.path))
+
+        try fm.moveItem(at: offline, to: first)
+        try chmod(["-N", old.pdf.path])
+        XCTAssertEqual(try EditorExport.write(doc, original: image, to: destination()).folder, next)
+        let meta = try readRecord(first.appendingPathComponent("Receipt.json"))
+        XCTAssertEqual(meta.editLayerCount, 1)
+        XCTAssertEqual(meta.pdfSHA256, try Exporter.sha256(of: old.pdf))
+        XCTAssertEqual(meta.pngSHA256, try Exporter.sha256(of: old.png))
+        XCTAssertTrue(tracking.entries.isEmpty)
+        XCTAssertFalse(fm.fileExists(atPath: first.appendingPathComponent(".living-scroll-export").path))
+    }
+
     func testStartupRecoveryFinishesAnInterruptedReplacement() throws {
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
