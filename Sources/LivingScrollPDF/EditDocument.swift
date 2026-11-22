@@ -37,6 +37,21 @@ struct EditLayer: Codable, Equatable, Identifiable {
         return rect.standardized.insetBy(dx: -margin, dy: -margin)
     }
 
+    /// Unlike the tile invalidation margin, this is the layer's footprint on the image.
+    /// In particular, a mask that ends at the first selected row belongs to the row above.
+    func intersectsSection(_ section: CGRect) -> Bool {
+        let footprint: CGRect
+        switch kind {
+        case .text, .image, .mosaic:
+            footprint = rect.standardized
+        case .pen, .highlighter, .rectangle, .ellipse, .arrow:
+            let geometry = kind == .arrow ? EditRenderer.arrowPath(for: self)?.boundingBoxOfPath ?? rect : rect
+            let radius = max(1, width) / 2
+            footprint = geometry.standardized.insetBy(dx: -radius, dy: -radius)
+        }
+        return !footprint.intersection(section).isEmpty
+    }
+
     func translated(dx: CGFloat, dy: CGFloat) -> Self {
         var moved = self
         moved.rect = rect.offsetBy(dx: dx, dy: dy)

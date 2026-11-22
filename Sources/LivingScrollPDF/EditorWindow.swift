@@ -6,6 +6,11 @@ import UniformTypeIdentifiers
 private final class EditorHostWindow: NSWindow {
     var handleShortcut: ((NSEvent) -> Bool)?
 
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown, event.keyCode == 53, attachedSheet == nil, handleShortcut?(event) == true { return }
+        super.sendEvent(event)
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if attachedSheet == nil, handleShortcut?(event) == true { return true }
         return super.performKeyEquivalent(with: event)
@@ -31,6 +36,15 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     private let detail = NSTextField(labelWithString: "")
     private let zoom = NSTextField(labelWithString: "")
     private var toolButtons: [(EditLayerKind?, NSButton)] = []
+    private lazy var cropButton = symbolButton("crop", EditorCopy.cropSection, #selector(toggleCrop), showTitle: true)
+    private let cropHint = NSTextField(wrappingLabelWithString: "")
+    private lazy var saveSectionButton = NSButton(title: EditorCopy.saveSection, target: self, action: #selector(saveSection))
+    private lazy var cancelSectionButton = NSButton(title: EditorCopy.cancel, target: self, action: #selector(endCrop))
+    private lazy var cropBar = row([cropHint, cancelSectionButton, saveSectionButton])
+    private let cropBarHeight: CGFloat = 44
+    private var scrollTop: NSLayoutConstraint!
+    private var cropOverlay: CropSectionOverlay?
+    private var editingControls: [NSControl] = []
     private lazy var undoButton = symbolButton("arrow.uturn.backward", EditorCopy.undo, #selector(undoEdits))
     private lazy var redoButton = symbolButton("arrow.uturn.forward", EditorCopy.redo, #selector(redoEdits))
     private lazy var deleteButton = symbolButton("trash", EditorCopy.delete, #selector(deleteLayer))
@@ -45,6 +59,7 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     private var activeSave: Task<EditDocument, Error>?
     private var localizeChrome: (() -> Void)?
     var onClose: (() -> Void)?
+    var onOpenSection: ((UUID) -> Void)?
     var showExportedFiles: ([URL]) -> Void = ExportUI.reveal
 
     init(document: EditDocument, original: CGImage, categoryID: UUID?, saved: Bool, library: ScrollLibrary = .shared) {
@@ -70,12 +85,15 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
         canvas.onSelectionChange = { [weak self] in self?.syncTools() }
         NotificationCenter.default.addObserver(self, selector: #selector(refreshCategories(_:)),
                                                 name: .scrollLibraryDidChange, object: library)
+        NotificationCenter.default.addObserver(self, selector: #selector(membershipPreferenceChanged(_:)),
+                                                name: UserDefaults.didChangeNotification, object: UserDefaults.standard)
         NotificationCenter.default.addObserver(self, selector: #selector(magnifying(_:)),
                                                 name: NSScrollView.willStartLiveMagnifyNotification, object: scroll)
         scroll.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(self, selector: #selector(updateZoomLabel(_:)),
                                                 name: NSView.boundsDidChangeNotification, object: scroll.contentView)
         syncTools()
+        refreshCropButton()
         showDimensions()
         refreshCategories()
     }
@@ -117,6 +135,7 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
         rail.blendingMode = .withinWindow
         let palette = NSStackView()
         palette.orientation = .vertical
+        palette.alignment = .leading
         palette.spacing = 4
         let tools: [(EditLayerKind?, String)] = [(nil, "cursorarrow"), (.pen, "pencil.tip"),
             (.highlighter, "highlighter"), (.rectangle, "rectangle"), (.ellipse, "circle"),
@@ -133,9 +152,14 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
         let paste = symbolButton("doc.on.clipboard", EditorCopy.pasteImage, #selector(pasteImage), showTitle: true)
         paste.widthAnchor.constraint(equalToConstant: 120).isActive = true
         palette.addArrangedSubview(paste)
+        cropButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
+        cropButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        palette.addArrangedSubview(cropButton)
+        editingControls = [paste, name, categories, save, export]
         rail.addSubview(palette)
         palette.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([palette.leadingAnchor.constraint(equalTo: rail.leadingAnchor, constant: 8),
+                                     palette.trailingAnchor.constraint(lessThanOrEqualTo: rail.trailingAnchor, constant: -8),
                                      palette.topAnchor.constraint(equalTo: rail.topAnchor, constant: 12)])
 
         scroll.hasVerticalScroller = true
@@ -146,6 +170,11 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
         scroll.maxMagnification = 8
         scroll.backgroundColor = .underPageBackgroundColor
         scroll.documentView = canvas
+        cropHint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        cropHint.maximumNumberOfLines = 2
+        cropHint.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        cropHint.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        cropBar.isHidden = true
 
         color.target = self
         color.action = #selector(changeColor)
@@ -163,6 +192,8 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
             name.placeholderString = EditorCopy.name
             name.setAccessibilityLabel(EditorCopy.name)
             categories.setAccessibilityLabel(EditorCopy.category)
+            cancelSectionButton.title = EditorCopy.cancel
+            saveSectionButton.title = EditorCopy.saveSection
             color.toolTip = EditorCopy.adjustColor
             color.setAccessibilityLabel(EditorCopy.adjustColor)
             for (button, label) in toolButtons.map({ ($0.1, EditorCopy.title(for: $0.0)) })
@@ -192,7 +223,7 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
         let topRule = NSBox(), bottomRule = NSBox()
         topRule.boxType = .separator
         bottomRule.boxType = .separator
-        for view in [header, topRule, rail, scroll, bottomRule, footer] as [NSView] {
+        for view in [header, topRule, rail, scroll, cropBar, bottomRule, footer] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview(view)
         }
@@ -200,15 +231,20 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
             band.leadingAnchor.constraint(equalTo: root.leadingAnchor).isActive = true
             band.trailingAnchor.constraint(equalTo: root.trailingAnchor).isActive = true
         }
+        scrollTop = scroll.topAnchor.constraint(equalTo: rail.topAnchor)
+        let preferredRailWidth = rail.widthAnchor.constraint(equalToConstant: 136)
+        preferredRailWidth.priority = .defaultHigh
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: root.topAnchor), header.heightAnchor.constraint(equalToConstant: 52),
             topRule.topAnchor.constraint(equalTo: header.bottomAnchor), topRule.heightAnchor.constraint(equalToConstant: 1),
             footer.bottomAnchor.constraint(equalTo: root.bottomAnchor), footer.heightAnchor.constraint(equalToConstant: 43),
             bottomRule.bottomAnchor.constraint(equalTo: footer.topAnchor), bottomRule.heightAnchor.constraint(equalToConstant: 1),
-            rail.leadingAnchor.constraint(equalTo: root.leadingAnchor), rail.widthAnchor.constraint(equalToConstant: 136),
+            rail.leadingAnchor.constraint(equalTo: root.leadingAnchor), preferredRailWidth,
             rail.topAnchor.constraint(equalTo: topRule.bottomAnchor), rail.bottomAnchor.constraint(equalTo: bottomRule.topAnchor),
+            cropBar.leadingAnchor.constraint(equalTo: rail.trailingAnchor), cropBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            cropBar.topAnchor.constraint(equalTo: rail.topAnchor), cropBar.heightAnchor.constraint(equalToConstant: cropBarHeight),
             scroll.leadingAnchor.constraint(equalTo: rail.trailingAnchor), scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: rail.topAnchor), scroll.bottomAnchor.constraint(equalTo: rail.bottomAnchor)
+            scrollTop, scroll.bottomAnchor.constraint(equalTo: rail.bottomAnchor)
         ])
     }
 
@@ -227,6 +263,9 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
         syncTools()
         showDimensions()
         refreshCategories()
+        refreshCropButton()
+        refreshCropControls()
+        cropOverlay?.needsDisplay = true
     }
 
     private func symbolButton(_ symbol: String, _ title: String, _ action: Selector, showTitle: Bool = false) -> NSButton {
@@ -247,6 +286,7 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     }
 
     @objc private func chooseTool(_ sender: NSButton) {
+        guard cropOverlay == nil else { return }
         canvas.finishTextEditing()
         let kind = toolButtons[sender.tag].0
         guard kind != .image else {
@@ -265,13 +305,19 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     }
 
     private func syncTools() {
+        let editing = cropOverlay == nil
         let selection = canvas.tool == nil || canvas.tool == .text ? canvas.selection : nil
         let kind = selection?.kind ?? canvas.tool
-        for (kind, button) in toolButtons { button.state = canvas.tool == kind ? .on : .off }
+        for (kind, button) in toolButtons {
+            button.isEnabled = editing
+            button.state = editing && canvas.tool == kind ? .on : .off
+        }
+        for control in editingControls { control.isEnabled = editing }
         let ink = selection?.color ?? canvas.ink
         color.color = NSColor(srgbRed: ink.red, green: ink.green, blue: ink.blue, alpha: 1)
         let hasInk = kind != nil && kind != .image && kind != .mosaic
-        color.isEnabled = hasInk
+        color.isEnabled = editing && hasInk
+        sizes.isEnabled = editing && hasInk
         sizeLabel.isHidden = !hasInk
         sizes.isHidden = !hasInk
         if hasInk {
@@ -288,12 +334,126 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
             }
             sizes.selectItem(at: choices.firstIndex(of: value) ?? 0)
         }
-        undoButton.isEnabled = canvas.canUndo
-        redoButton.isEnabled = canvas.canRedo
-        deleteButton.isEnabled = canvas.selection != nil
+        undoButton.isEnabled = editing && canvas.canUndo
+        redoButton.isEnabled = editing && canvas.canRedo
+        deleteButton.isEnabled = editing && canvas.selection != nil
+        cropButton.state = editing ? .off : .on
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) { refreshCropButton() }
+
+    @objc nonisolated private func membershipPreferenceChanged(_ notification: Notification) {
+        Task { @MainActor [weak self] in self?.refreshCropButton() }
+    }
+
+    private func refreshCropButton() {
+        let label = EditorCopy.cropSection
+        let title = NSMutableAttributedString(string: label)
+        if !Membership.allows(.cropSection) {
+            title.append(NSAttributedString(string: "  " + L("会员", "Pro"), attributes: [
+                .font: NSFont.systemFont(ofSize: 9, weight: .semibold), .foregroundColor: NSColor.secondaryLabelColor
+            ]))
+        }
+        cropButton.attributedTitle = title
+        cropButton.setAccessibilityLabel(title.string)
+        cropButton.toolTip = L("选择两条水平线，把中间一段另存到图库", "Select two lines to save the section between them to your library")
+        cropButton.state = cropOverlay == nil ? .off : .on
+    }
+
+    private func refreshCropControls() {
+        let rows = cropOverlay?.selectedRows
+        let tooShort = rows.map { $0.count < CropSource.minimumHeight } ?? false
+        if let rows, !tooShort {
+            cropHint.stringValue = L("拖动横线微调", "Drag a line to adjust") + " · \(rows.count) px"
+        } else {
+            cropHint.stringValue = tooShort ? EditorCopy.cropTooShort : EditorCopy.cropHint
+        }
+        cropHint.textColor = tooShort ? .systemOrange : .labelColor
+        saveSectionButton.isEnabled = rows != nil && !tooShort
+    }
+
+    @objc private func toggleCrop() {
+        guard !isBusy, let window else { return }
+        if cropOverlay != nil { endCrop(); return }
+        guard Membership.allows(.cropSection) else {
+            refreshCropButton()
+            showMembership(in: window)
+            return
+        }
+        canvas.finishTextEditing()
+        let overlay = CropSectionOverlay(frame: canvas.bounds)
+        overlay.onSelectionChange = { [weak self] in self?.refreshCropControls() }
+        overlay.onCancel = { [weak self] in self?.endCrop() }
+        cropOverlay = overlay
+        canvas.addSubview(overlay)
+        canvas.showsLayerSelection = false
+        cropBar.isHidden = false
+        scrollTop.constant = cropBarHeight
+        refreshCropControls()
+        syncTools()
+        window.makeFirstResponder(overlay)
+    }
+
+    @objc private func endCrop() {
+        guard !isBusy, let overlay = cropOverlay else { return }
+        overlay.removeFromSuperview()
+        cropOverlay = nil
+        canvas.showsLayerSelection = true
+        cropBar.isHidden = true
+        scrollTop.constant = 0
+        syncTools()
+        window?.makeFirstResponder(canvas)
+    }
+
+    private func showMembership(in window: NSWindow) {
+        let alert = NSAlert()
+        alert.messageText = Membership.Required().localizedDescription
+        alert.addButton(withTitle: L("了解会员", "Learn About Membership"))
+        alert.addButton(withTitle: L("好", "OK"))
+        alert.beginSheetModal(for: window) { result in
+            if result == .alertFirstButtonReturn, let url = URL(string: "https://scroll.mymomentsmaker.com/") {
+                NSWorkspace.shared.open(url)
+            }
+        }
+    }
+
+    @objc private func saveSection() {
+        guard !isBusy, let window, let rows = cropOverlay?.selectedRows, rows.count >= CropSource.minimumHeight else { return }
+        guard Membership.allows(.cropSection) else {
+            endCrop()
+            refreshCropButton()
+            showMembership(in: window)
+            return
+        }
+        autosave?.cancel()
+        let progress = showProgress(EditorCopy.savingSection, in: window)
+        Task {
+            let result: Result<EditDocument, Error>
+            do {
+                let parent = try await saveCurrentEdits()
+                let original = self.original, library = self.library
+                result = await Task.detached(priority: .userInitiated) {
+                    try library.cropSection(of: parent, original: original, rows: rows)
+                }.result
+            } catch { result = .failure(error) }
+            window.endSheet(progress)
+            isBusy = false
+            switch result {
+            case .success(let child):
+                endCrop()
+                onOpenSection?(child.id)
+            case .failure(let error):
+                if error is Membership.Required {
+                    endCrop()
+                    refreshCropButton()
+                    showMembership(in: window)
+                } else { showError(error.localizedDescription) }
+            }
+        }
     }
 
     @objc private func changeColor() {
+        guard cropOverlay == nil else { return }
         guard let rgb = color.color.usingColorSpace(.sRGB) else { return }
         canvas.ink = InkColor(red: rgb.redComponent, green: rgb.greenComponent, blue: rgb.blueComponent)
         if let kind = canvas.tool { toolColors[kind] = canvas.ink }
@@ -301,6 +461,7 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
     }
 
     @objc private func changeSize() {
+        guard cropOverlay == nil else { return }
         guard let number = sizes.selectedItem?.representedObject as? NSNumber else { return }
         let value = CGFloat(number.doubleValue)
         if (canvas.selection?.kind == .text && canvas.tool == nil) || canvas.tool == .text {
@@ -716,9 +877,11 @@ final class EditorWindow: NSWindowController, NSWindowDelegate, NSTextFieldDeleg
 
     private func shortcut(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if cropOverlay != nil, flags.isEmpty, event.keyCode == 53 { endCrop(); return true }
         guard flags.contains(.command), !flags.contains(.option), !flags.contains(.control),
               let key = event.charactersIgnoringModifiers?.lowercased() else { return false }
         let typing = window?.firstResponder is NSTextView
+        if cropOverlay != nil, ["v", "z", "s", "e"].contains(key) { return true }
         switch key {
         case "s" where flags == .command: saveEdits()
         case "e" where flags == [.command, .shift]: exportEdits()

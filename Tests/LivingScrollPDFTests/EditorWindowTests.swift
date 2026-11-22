@@ -23,6 +23,163 @@ final class EditorWindowTests: XCTestCase {
                 pixelWidth: width, pixelHeight: height, pointScale: 2))
     }
 
+    @MainActor func testMemberGateKeepsCropVisibleAndExistingEditsAvailable() async throws {
+        _ = NSApplication.shared
+        let defaults = UserDefaults.standard, key = "membershipActive"
+        let previous = defaults.object(forKey: key)
+        defaults.set(false, forKey: key)
+        defer { defaults.set(previous, forKey: key) }
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let library = ScrollLibrary(outputFolder: base.appendingPathComponent("Exports"), root: base.appendingPathComponent("Library"))
+        let (image, record) = try capture()
+        let saved = try library.save(EditDocument(name: "Notes", record: record), original: image, categoryID: nil)
+        let editor = EditorWindow(document: saved, original: image, categoryID: nil, saved: true, library: library)
+        let window = try XCTUnwrap(editor.window)
+        defer {
+            if let sheet = NSApp.windows.first(where: { $0.sheetParent === window }) { window.endSheet(sheet) }
+            window.close()
+        }
+        let views = descendants(try XCTUnwrap(window.contentView))
+        let buttons = views.compactMap { $0 as? NSButton }
+        let crop = try XCTUnwrap(buttons.first { $0.title.hasPrefix(L("截一段", "Crop Section")) })
+        window.setContentSize(window.contentMinSize)
+        window.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertLessThanOrEqual(try XCTUnwrap(crop.cell).cellSize.width, crop.bounds.width + 1)
+        XCTAssertTrue(crop.isEnabled)
+        XCTAssertTrue(crop.attributedTitle.string.contains(L("会员", "Pro")))
+        crop.performClick(nil)
+        let sheet = try XCTUnwrap(NSApp.windows.first { $0.sheetParent === window })
+        let prompt = descendants(try XCTUnwrap(sheet.contentView))
+        XCTAssertTrue(prompt.contains { ($0 as? NSTextField)?.stringValue == L("截一段是会员功能", "Crop Section is a member feature") })
+        for title in [L("了解会员", "Learn About Membership"), L("好", "OK")] {
+            XCTAssertTrue(prompt.contains { ($0 as? NSButton)?.title == title })
+        }
+        window.endSheet(sheet, returnCode: .alertSecondButtonReturn)
+        try await waitFor("membership prompt closes") { sheet.sheetParent == nil }
+        XCTAssertTrue(try XCTUnwrap(buttons.first { $0.title == EditorCopy.title(for: .mosaic) }).isEnabled)
+        XCTAssertTrue(try XCTUnwrap(buttons.first { $0.title == EditorCopy.export }).isEnabled)
+        XCTAssertEqual(try library.entries().map(\.id), [saved.id])
+    }
+
+    @MainActor func testCropFromLongEditorSavesPendingEditsAndExpiredMemberCanEditAndExportChild() async throws {
+        _ = NSApplication.shared
+        let defaults = UserDefaults.standard, memberKey = "membershipActive"
+        let previous = defaults.object(forKey: memberKey)
+        defaults.set(true, forKey: memberKey)
+        defer { defaults.set(previous, forKey: memberKey) }
+        let fm = FileManager.default, base = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: base) }
+        let export = base.appendingPathComponent("Chosen")
+        try fm.createDirectory(at: export, withIntermediateDirectories: true)
+        let library = ScrollLibrary(root: base.appendingPathComponent("Private")) {
+            ExportDestination(defaultFolder: base.appendingPathComponent("Desktop"), customFolder: export)
+        }
+        let width = 96, height = 30_041
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                          bytesPerRow: width * 4, space: Stitcher.colorSpace,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.setFillColor(gray: 1, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let image = try XCTUnwrap(ctx.makeImage())
+        let record = CaptureRecord(appName: "Editor", windowTitle: "Receipt", startedAt: Date(), endedAt: Date(),
+                                   framesStitched: 12, droppedFrames: 0, pixelWidth: width, pixelHeight: height, pointScale: 2)
+        let category = try library.addCategory("Examples")
+        let parent = try library.save(EditDocument(name: "Original", record: record), original: image, categoryID: category.id)
+        let editor = EditorWindow(document: parent, original: image, categoryID: category.id, saved: true, library: library)
+        let window = try XCTUnwrap(editor.window), content = try XCTUnwrap(window.contentView)
+        defer { window.close() }
+        window.setContentSize(window.contentMinSize)
+        content.layoutSubtreeIfNeeded()
+        let views = descendants(content), buttons = views.compactMap { $0 as? NSButton }
+        let canvas = try XCTUnwrap(views.compactMap { $0 as? EditCanvas }.first)
+        let crop = try XCTUnwrap(buttons.first { $0.title == EditorCopy.cropSection })
+        let save = try XCTUnwrap(buttons.first { $0.title == EditorCopy.saveSection })
+        let pen = try XCTUnwrap(buttons.first { $0.title == EditorCopy.title(for: .pen) })
+        func clickRow(_ row: Int, on overlay: CropSectionOverlay) throws {
+            let point = overlay.convert(CGPoint(x: 45, y: row), to: nil)
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                let event = try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+                                          windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+                if type == .leftMouseDown { overlay.mouseDown(with: event) } else { overlay.mouseUp(with: event) }
+            }
+        }
+        crop.performClick(nil)
+        content.layoutSubtreeIfNeeded()
+        let short = try XCTUnwrap(canvas.subviews.compactMap { $0 as? CropSectionOverlay }.first)
+        XCTAssertFalse(pen.isEnabled)
+        XCTAssertFalse(save.isEnabled)
+        try clickRow(50, on: short)
+        try clickRow(40, on: short)
+        XCTAssertFalse(save.isEnabled)
+        XCTAssertTrue(views.contains { ($0 as? NSTextField)?.stringValue == EditorCopy.cropTooShort })
+        let esc = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                               windowNumber: window.windowNumber, context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}",
+                               isARepeat: false, keyCode: 53))
+        window.makeFirstResponder(try XCTUnwrap(buttons.first { $0.title == EditorCopy.fit }))
+        window.sendEvent(esc)
+        XCTAssertNil(short.superview)
+        XCTAssertTrue(pen.isEnabled)
+        XCTAssertEqual(try library.load(parent.id).document.revision, parent.revision)
+
+        let field = try XCTUnwrap(views.compactMap { $0 as? NSTextField }.first { $0.placeholderString == EditorCopy.name })
+        field.stringValue = "Notes"
+        editor.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: field))
+        canvas.tool = .mosaic
+        canvas.beginInteraction(at: CGPoint(x: 10, y: 10))
+        canvas.endInteraction(at: CGPoint(x: 85, y: 80))
+        let mask = try XCTUnwrap(canvas.layers.first)
+        var openedID: UUID?
+        editor.onOpenSection = { openedID = $0 }
+        crop.performClick(nil)
+        content.layoutSubtreeIfNeeded()
+        let overlay = try XCTUnwrap(canvas.subviews.compactMap { $0 as? CropSectionOverlay }.first)
+        try clickRow(30, on: overlay)
+        XCTAssertFalse(save.isEnabled)
+        canvas.scroll(CGPoint(x: 0, y: height))
+        try clickRow(30_035, on: overlay)
+        XCTAssertTrue(save.isEnabled)
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(save.action), to: save.target, from: save))
+        XCTAssertTrue(editor.isBusy)
+        let progress = try XCTUnwrap(NSApp.windows.first { $0.sheetParent === window })
+        XCTAssertTrue(descendants(try XCTUnwrap(progress.contentView)).contains { $0 is NSProgressIndicator })
+        try await waitFor("the new library entry opens after the private save") { openedID != nil && !editor.isBusy }
+        let id = try XCTUnwrap(openedID), child = try library.load(id)
+        XCTAssertNil(overlay.superview)
+        XCTAssertEqual(child.document.name, L("Notes-片段1", "Notes-Section 1"))
+        XCTAssertEqual(child.categoryID, category.id)
+        XCTAssertEqual(child.original.height, 30_005)
+        XCTAssertEqual(child.document.layers, [mask.translated(dx: 0, dy: -30)])
+        XCTAssertEqual(try library.load(parent.id).document.layers, [mask])
+        XCTAssertEqual(try library.load(parent.id).document.name, "Notes")
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: export.path), [])
+
+        defaults.set(false, forKey: memberKey)
+        let next = EditorWindow(document: child.document, original: child.original, categoryID: child.categoryID, saved: true, library: library)
+        let nextWindow = try XCTUnwrap(next.window)
+        defer {
+            if let sheet = NSApp.windows.first(where: { $0.sheetParent === nextWindow }) { nextWindow.endSheet(sheet) }
+            nextWindow.close()
+        }
+        let nextViews = descendants(try XCTUnwrap(nextWindow.contentView))
+        let nextCanvas = try XCTUnwrap(nextViews.compactMap { $0 as? EditCanvas }.first)
+        let mosaic = try XCTUnwrap(nextViews.compactMap { $0 as? NSButton }.first { $0.title == EditorCopy.title(for: .mosaic) })
+        mosaic.performClick(nil)
+        nextCanvas.beginInteraction(at: CGPoint(x: 15, y: 120))
+        nextCanvas.endInteraction(at: CGPoint(x: 80, y: 150))
+        var published: [URL]?
+        next.showExportedFiles = { published = $0 }
+        let exportButton = try XCTUnwrap(nextViews.compactMap { $0 as? NSButton }.first { $0.title == EditorCopy.export })
+        exportButton.performClick(nil)
+        try await waitFor("expired membership still allows export through the editor") { published != nil }
+        let files = try XCTUnwrap(published)
+        XCTAssertEqual(files.map(\.pathExtension), ["png", "pdf"])
+        XCTAssertTrue(files.allSatisfy { $0.deletingLastPathComponent().standardizedFileURL.path == export.standardizedFileURL.path })
+        XCTAssertEqual(try library.load(id).document.layers.count, 2)
+        XCTAssertThrowsError(try library.cropSection(of: child.document, original: child.original, rows: 0..<60)) { XCTAssertTrue($0 is Membership.Required) }
+        XCTAssertEqual(try library.entries().count, 2)
+    }
+
     @MainActor func testCapturePersistsBeforeEditingAndTypingAutosavesWithoutLosingFocus() async throws {
         _ = NSApplication.shared
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

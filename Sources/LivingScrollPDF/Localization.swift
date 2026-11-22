@@ -72,6 +72,13 @@ enum EditorCopy {
     static var discard: String { L("放弃更改", "Discard Changes") }
     static var cancel: String { L("取消", "Cancel") }
     static var partial: String { L("未完成截图", "Partial capture") }
+    static var cropSection: String { L("截一段", "Crop Section") }
+    static var cropHint: String {
+        L("点一下定开始线，往下滚到要结束的地方再点一下", "Click the start line, then scroll and click the end.")
+    }
+    static var cropTooShort: String { L("选得太短了", "Selection is too short") }
+    static var saveSection: String { L("另存为新长截图", "Save as New Screenshot") }
+    static var savingSection: String { L("正在保存新长截图…", "Saving new screenshot…") }
 
     static func title(for kind: EditLayerKind?) -> String {
         switch kind {

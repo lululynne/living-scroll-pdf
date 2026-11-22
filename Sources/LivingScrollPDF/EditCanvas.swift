@@ -24,6 +24,9 @@ final class EditCanvas: NSView, NSTextViewDelegate {
     }
     var onChange: (() -> Void)?
     var onSelectionChange: (() -> Void)?
+    var showsLayerSelection = true {
+        didSet { invalidateOutline(selection) }
+    }
 
     private var selectedID: UUID?
     var selection: EditLayer? { layers.first { $0.id == selectedID } }
@@ -133,7 +136,7 @@ final class EditCanvas: NSView, NSTextViewDelegate {
                                             withAttributes: [.foregroundColor: NSColor.secondaryLabelColor])
             }
         }
-        if textEditor == nil, let layer = drag?.original == nil ? selection : preview {
+        if showsLayerSelection, textEditor == nil, let layer = drag?.original == nil ? selection : preview {
             drawSelection(layer)
         }
     }

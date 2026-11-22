@@ -5,6 +5,14 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
+/// Pixel rows in the immediate parent, counted from the top. The end row is exclusive.
+struct CropSource: Codable, Equatable {
+    static let minimumHeight = 20
+    let id: UUID
+    let start: Int
+    let end: Int
+}
+
 struct CaptureRecord: Codable {
     var tool = "卷轴PDF · Living Scroll PDF \(Exporter.version)"
     var appName: String
@@ -31,6 +39,7 @@ struct CaptureRecord: Codable {
     /// A local library reference allows a flattened export to reopen with its original layers.
     var editingProjectID: UUID? = nil
     var editLayerCount: Int? = nil
+    var croppedFrom: CropSource? = nil
 }
 
 /// A stretch that was on screen and is not in the image. `afterRow` is the image height:
@@ -74,6 +83,7 @@ enum Exporter {
 
     /// 200 inches: the largest page Acrobat and most viewers accept.
     static let maxPagePoints = 14_400
+    static let maxStemBytes = 220
 
     static var outputFolder: URL { ExportDestination.current().folder }
     static var outputFolders: [URL] { ExportDestination.current().recoveryFolders }
@@ -112,7 +122,7 @@ enum Exporter {
         }
         var stem = ""
         for character in cleaned {
-            if stem.utf8.count + String(character).utf8.count > 220 { break }
+            if stem.utf8.count + String(character).utf8.count > maxStemBytes { break }
             stem.append(character)
         }
         if stem.isEmpty && !cleaned.isEmpty { stem = L("长截图", "Screenshot") }

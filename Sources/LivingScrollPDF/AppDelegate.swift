@@ -226,6 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let open = editors.first(where: { $0.documentID == id }) { open.present(); return }
         let editor = EditorWindow(document: document, original: original, categoryID: categoryID, saved: saveError == nil)
         editors.append(editor)
+        editor.onOpenSection = { [weak self] id in self?.openSavedCapture(id) }
         editor.onClose = { [weak self, weak editor] in self?.editors.removeAll { $0 === editor } }
         editor.present()
         if let saveError { editor.showSaveProblem(saveError) }

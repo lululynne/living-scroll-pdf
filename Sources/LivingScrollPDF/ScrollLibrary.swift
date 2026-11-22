@@ -443,7 +443,8 @@ final class ScrollLibrary {
                   let width = properties[kCGImagePropertyPixelWidth] as? Int,
                   let height = properties[kCGImagePropertyPixelHeight] as? Int else { continue }
             guard let doc = try newestDocument(in: folder, width: width, height: height), let revision = doc.revision else { continue }
-            recovered.append(ScrollEntry(id: doc.id, name: doc.name, date: doc.record.endedAt, categoryID: nil,
+            let category = doc.record.croppedFrom.flatMap { source in entries.first { $0.id == source.id }?.categoryID }
+            recovered.append(ScrollEntry(id: doc.id, name: doc.name, date: doc.record.endedAt, categoryID: category,
                                          directoryID: directoryID, collection: collection, revision: revision))
         }
         return recovered
@@ -664,6 +665,73 @@ final class ScrollLibrary {
         }
     }
 
+    /// Crop the saved layers the editor is showing. A rename or category move is
+    /// compatible, but a different set of masks in another window needs a fresh preview.
+    func cropSection(of source: EditDocument, original: CGImage, rows: Range<Int>) throws -> EditDocument {
+        try withProjectLock {
+            guard Membership.allows(.cropSection) else { throw Membership.Required() }
+            guard rows.lowerBound >= 0, rows.upperBound <= original.height,
+                  rows.count >= CropSource.minimumHeight else { throw LibraryError.invalidSection }
+            let index = try indexLocked()
+            guard let entry = index.entries.first(where: { $0.id == source.id }) else { throw LibraryError.projectGone }
+            guard let revision = source.revision else { throw LibraryError.sectionChanged }
+            guard source.record.pixelWidth == original.width, source.record.pixelHeight == original.height else { throw LibraryError.dimensions }
+            try checkProjectFolder(entry)
+            if revision != entry.revision {
+                guard let current = try document(at: sidecar(entry), revision: entry.revision, id: source.id,
+                                                 dimensions: (original.width, original.height)) else { throw LibraryError.recordMismatch }
+                guard current.layers == source.layers else { throw LibraryError.sectionChanged }
+            }
+            let rect = CGRect(x: 0, y: rows.lowerBound, width: original.width, height: rows.count)
+            guard let pixels = original.cropping(to: rect) else { throw LibraryError.invalidImage }
+            var record = source.record
+            record.pixelWidth = pixels.width
+            record.pixelHeight = pixels.height
+            record.croppedFrom = CropSource(id: source.id, start: rows.lowerBound, end: rows.upperBound)
+            record.editingProjectID = nil
+            record.editLayerCount = nil
+            record.pngSHA256 = ""
+            record.pdfSHA256 = ""
+            record.pdfPages = 0
+            if let gaps = record.gaps {
+                let kept = gaps.compactMap { gap -> ContentGap? in
+                    guard rows.lowerBound < gap.afterRow, gap.afterRow <= rows.upperBound else { return nil }
+                    return ContentGap(afterRow: gap.afterRow - rows.lowerBound, droppedFrames: gap.droppedFrames, reason: gap.reason)
+                }
+                record.gaps = kept.isEmpty ? nil : kept
+            }
+            let layers = source.layers.compactMap { layer in
+                layer.intersectsSection(rect) ? layer.translated(dx: 0, dy: -rect.minY) : nil
+            }
+            let name = sectionName(for: entry, in: index, record: record)
+            let child = EditDocument(name: name, record: record, layers: layers)
+            let folder = project(child.id)
+            guard try type(of: folder) == nil else { throw CocoaError(.fileWriteFileExists) }
+            do {
+                return try save(child, original: pixels, categoryID: entry.categoryID, index: index)
+            } catch {
+                // The parent is already durable. A failed Save as New followed by
+                // a retry must not leave a second, recoverable copy of this section.
+                try? fm.removeItem(at: folder)
+                throw error
+            }
+        }
+    }
+
+    private func sectionName(for parent: ScrollEntry, in index: Index, record: CaptureRecord) -> String {
+        let names = Set(index.entries.map { $0.name.lowercased() })
+        let stem = Exporter.fileStem(for: record, name: parent.name)
+        var number = 1
+        while true {
+            let suffix = L("-片段", "-Section ") + String(number)
+            var prefix = stem
+            while prefix.utf8.count + suffix.utf8.count > Exporter.maxStemBytes { prefix.removeLast() }
+            let name = prefix + suffix
+            if !names.contains(name.lowercased()) { return name }
+            number += 1
+        }
+    }
+
     @discardableResult
     func save(_ document: EditDocument, original: CGImage, categoryID: UUID?, preservingCategory: Bool = false) throws -> EditDocument {
         try withProjectLock {
@@ -860,6 +928,7 @@ final class ScrollLibrary {
 
     private enum LibraryError: LocalizedError {
         case version, emptyName, duplicateCategory, categoryGone, projectGone, originalGone, dimensions, invalidImage, recordMismatch, invalidLocation
+        case invalidSection, sectionChanged
         case migrationPending(Error)
         var errorDescription: String? {
             switch self {
@@ -871,6 +940,9 @@ final class ScrollLibrary {
             case .originalGone: return L("读取原图失败，请检查截图库的项目文件夹。", "The original PNG could not be read. Check the library’s project folder.")
             case .dimensions: return L("原图尺寸与编辑记录不一致。", "The original image dimensions do not match the edit record.")
             case .invalidImage: return L("无法读取这张 PNG。", "This PNG could not be read.")
+            case .invalidSection: return L("请在图内选择至少 20 像素高的一段。", "Choose at least 20 pixel rows within the image.")
+            case .sectionChanged: return L("原图的编辑已变更。请关闭这个窗口，从「我的长截图」重新打开，核对打码后再截取。",
+                                           "The source edits have changed. Close this window and reopen it from My Screenshots to check the masks before cropping.")
             case .recordMismatch: return L("截图与随附记录不匹配。", "The screenshot does not match its accompanying record.")
             case .invalidLocation: return L("图库路径已更改，请检查项目文件夹。", "The library path has changed. Check its project folder.")
             case .migrationPending(let error): return L("旧图库尚待迁移。", "Migration of an older library is still pending. ") + error.localizedDescription

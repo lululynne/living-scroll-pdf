@@ -35,7 +35,7 @@ final class BandedExportTests: XCTestCase {
         }
     }
 
-    func testVisionReadsRetinaTextBeforeMosaicAndCannotReadItInExport() throws {
+    private func textToRedact() throws -> (image: CGImage, mosaic: EditLayer) {
         let width = 560, height = 128
         let bounds = CGRect(x: 0, y: 0, width: width, height: height)
         let context = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
@@ -50,8 +50,11 @@ final class BandedExportTests: XCTestCase {
         ])
         context.textPosition = CGPoint(x: 48, y: 60)
         CTLineDraw(CTLineCreateWithAttributedString(text), context)
-        let image = try XCTUnwrap(context.makeImage())
+        let mosaic = EditLayer(kind: .mosaic, rect: CGRect(x: 38, y: 32, width: 280, height: 52))
+        return (try XCTUnwrap(context.makeImage()), mosaic)
+    }
 
+    private func assertVisionRedaction(original: CGImage, exports: [CGImage]) {
         func recognize(_ image: CGImage, _ level: VNRequestTextRecognitionLevel) throws -> [String] {
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = level
@@ -66,31 +69,118 @@ final class BandedExportTests: XCTestCase {
             return (request.results ?? []).flatMap { $0.topCandidates(3).map { $0.string.uppercased() } }
         }
 
-        let evidence = ProcessInfo.processInfo.environment["LIVING_SCROLL_OCR_FIXTURES"].map(URL.init(fileURLWithPath:))
-        let folder = evidence ?? FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { if evidence == nil { try? FileManager.default.removeItem(at: folder) } }
-        let mosaic = EditLayer(kind: .mosaic, rect: CGRect(x: 38, y: 32, width: 280, height: 52))
-        let pdf = try Exporter.export(image, record: record(image), folder: folder, name: "redacted", layers: [mosaic])
-        if evidence != nil { try Exporter.writePNG(image, to: folder.appendingPathComponent("original.png")) }
-        let result = try png(pdf)
         var issues: [String] = []
         for level: VNRequestTextRecognitionLevel in [.accurate, .fast] {
             do {
-                let before = try recognize(image, level)
+                let before = try recognize(original, level)
                 guard before.contains(where: { $0.contains("PRIVATE") }),
                       before.contains(where: { $0.contains("865927") }) else {
                     issues.append("level \(level.rawValue) read \(before) from the original")
                     continue
                 }
-                let after = try recognize(result, level)
-                XCTAssertFalse(after.contains { $0.contains("PRIVATE") || $0.contains("865927") }, "\(after)")
-                print("Vision OCR positive: \(before); 2× redacted export: \(after)")
+                for image in exports {
+                    let after = try recognize(image, level)
+                    XCTAssertFalse(after.contains { $0.contains("PRIVATE") || $0.contains("865927") }, "\(after)")
+                    print("Vision OCR positive: \(before); 2× redacted export: \(after)")
+                }
                 return
             } catch {
                 issues.append("level \(level.rawValue): \(error)")
             }
         }
         XCTFail("Vision could not complete the positive-control/export comparison: \(issues.joined(separator: ", "))")
+    }
+
+    func testVisionReadsRetinaTextBeforeMosaicAndCannotReadItInExport() throws {
+        let (image, mosaic) = try textToRedact()
+        let evidence = ProcessInfo.processInfo.environment["LIVING_SCROLL_OCR_FIXTURES"].map(URL.init(fileURLWithPath:))
+        let folder = evidence ?? FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { if evidence == nil { try? FileManager.default.removeItem(at: folder) } }
+        let pdf = try Exporter.export(image, record: record(image), folder: folder, name: "redacted", layers: [mosaic])
+        if evidence != nil { try Exporter.writePNG(image, to: folder.appendingPathComponent("original.png")) }
+        assertVisionRedaction(original: image, exports: [try png(pdf)])
+    }
+
+    private func withCroppedTextExports(_ check: (CGImage, CGImage, CGImage) throws -> Void) throws {
+        let fm = FileManager.default, base = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: base) }
+        let privateRoot = base.appendingPathComponent("Application Support/Library")
+        let chosen = base.appendingPathComponent("Chosen", isDirectory: true)
+        let fallback = base.appendingPathComponent("Desktop", isDirectory: true)
+        try fm.createDirectory(at: chosen, withIntermediateDirectories: true)
+        let library = ScrollLibrary(root: privateRoot) { ExportDestination(defaultFolder: fallback, customFolder: chosen) }
+        let (image, mosaic) = try textToRedact()
+        let parent = try library.save(EditDocument(name: "Receipt", record: record(image), layers: [mosaic]),
+                                      original: image, categoryID: nil)
+        let child = try library.cropSection(of: parent, original: image, rows: 40..<111)
+        let reopened = try library.load(child.id)
+        XCTAssertEqual(reopened.document.layers, [mosaic.translated(dx: 0, dy: -40)])
+        XCTAssertTrue(try library.originalURL(for: child.id).path.hasPrefix(privateRoot.path + "/"))
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: chosen.path), [])
+        let result = try EditorExport.write(reopened.document, original: reopened.original, to: library.exportDestination)
+        XCTAssertEqual(result.folder.standardizedFileURL.path, chosen.standardizedFileURL.path)
+        XCTAssertFalse(fm.fileExists(atPath: fallback.path))
+        let json = result.pdf.deletingPathExtension().appendingPathExtension("json")
+        XCTAssertEqual(Set(try fm.contentsOfDirectory(atPath: chosen.path)), Set((result.files + [json]).map(\.lastPathComponent)))
+
+        let pdf = try XCTUnwrap(CGPDFDocument(result.pdf as CFURL))
+        XCTAssertEqual(pdf.numberOfPages, 1)
+        let page = try XCTUnwrap(pdf.page(at: 1)), scale = reopened.document.record.pointScale
+        let width = reopened.original.width, height = reopened.original.height
+        XCTAssertEqual(page.getBoxRect(.mediaBox).size, CGSize(width: Double(width) / scale, height: Double(height) / scale))
+        let surface = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                              bytesPerRow: width * 4, space: Stitcher.colorSpace,
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        surface.scaleBy(x: scale, y: scale)
+        surface.drawPDFPage(page)
+        try check(reopened.original, png(result.pdf), XCTUnwrap(surface.makeImage()))
+    }
+
+    func testCroppedMosaicRemovesGlyphPixelsFromPNGAndPDF() throws {
+        try withCroppedTextExports { privateImage, png, pdf in
+            let original = try XCTUnwrap(PixelFrame(cgImage: privateImage))
+            let raster = try XCTUnwrap(PixelFrame(cgImage: png))
+            let pdfRaster = try XCTUnwrap(PixelFrame(cgImage: pdf))
+            XCTAssertEqual(original.width, 560)
+            XCTAssertEqual(original.height, 71)
+            guard raster.width == original.width, raster.height == original.height else {
+                return XCTFail("PNG dimensions differ from the private crop")
+            }
+            XCTAssertTrue(raster.bytes == pdfRaster.bytes, "The published PDF must show the same redacted pixels as the PNG")
+            // The top of this 2× mosaic is clipped. Every visible piece of each 32 px
+            // cell should have a single color, including cells intersecting the crop edge.
+            var darkInk = 0, removedInk = 0, shadedPixels = 0
+            for y in 0..<original.height {
+                for x in 0..<original.width {
+                    let offset = 4 * (y * original.width + x)
+                    let pixel = raster.bytes[offset..<(offset + 4)]
+                    if (38..<318).contains(x), y < 44 {
+                        let left = max(38, x / 32 * 32), top = y / 32 * 32
+                        let corner = 4 * (top * original.width + left)
+                        guard pixel.elementsEqual(raster.bytes[corner..<(corner + 4)]) else {
+                            return XCTFail("Glyph detail survived inside a mosaic cell at (\(x), \(y))")
+                        }
+                        if original.bytes[offset] < 80 {
+                            darkInk += 1
+                            if raster.bytes[offset] > 128 { removedInk += 1 }
+                        }
+                        if raster.bytes[offset] < 248 { shadedPixels += 1 }
+                    } else if !pixel.elementsEqual(original.bytes[offset..<(offset + 4)]) {
+                        return XCTFail("Pixels outside the mosaic changed at (\(x), \(y))")
+                    }
+                }
+            }
+            XCTAssertGreaterThan(darkInk, 200, "The unredacted original must still contain legible dark ink")
+            XCTAssertEqual(removedInk, darkInk)
+            XCTAssertGreaterThan(shadedPixels, 0, "The export must contain real mosaic cells")
+            print("Cropped mosaic: \(removedInk)/\(darkInk) original dark text pixels replaced; PNG and PDF rasters compared.")
+        }
+    }
+
+    func testVisionReadsPrivateCropButCannotReadItsRedactedPNGOrPDF() throws {
+        try withCroppedTextExports { original, png, pdf in
+            assertVisionRedaction(original: original, exports: [png, pdf])
+        }
     }
 
     func testDifferentMosaicGridsAgreeAtStripEdgesAndAcrossPDFPageCuts() throws {
