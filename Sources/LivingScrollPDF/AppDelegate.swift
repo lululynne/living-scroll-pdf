@@ -12,6 +12,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var editors: [EditorWindow] = []
     private var opening: Set<UUID> = []
     private var quitAfterCapture = false
+    private let updateChecker = UpdateChecker()
+    private var availableRelease: AppRelease?
     private lazy var library = LibraryWindow(onDelete: { [weak self] id in
         self?.opening.remove(id)
         self?.editors.first { $0.documentID == id }?.close()
@@ -24,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         installEditingMenu()
         buildMenu()
         registerHotKey()
+        scheduleAutomaticUpdateCheck()
 
         if let owner = ProcessInfo.processInfo.environment["JZ_TEST_OWNER"] {
             runEndToEndTest(owner: owner)
@@ -85,6 +88,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let library = NSMenuItem(title: EditorCopy.library, action: #selector(showLibrary), keyEquivalent: "")
             library.target = self
             menu.addItem(library)
+            let updates = NSMenuItem(title: L("检查更新…", "Check for Updates…"), action: #selector(checkForUpdates), keyEquivalent: "")
+            updates.tag = 7106
+            updates.target = self
+            menu.addItem(updates)
+            menu.addItem(.separator())
             let choose = menu.addItem(withTitle: EditorCopy.exportLocation, action: #selector(chooseExportLocation), keyEquivalent: "")
             choose.target = self
             let folder = NSMenuItem(title: "", action: #selector(openFolder), keyEquivalent: "")
@@ -147,13 +155,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        guard let item = menu.items.first(where: { $0.action == #selector(openFolder) }) else { return }
-        let path = ExportUI.path(ScrollLibrary.shared.outputFolder)
-        item.title = L("打开输出文件夹（\(path)）", "Open Output Folder (\(path))")
-        item.toolTip = path
-        let name = ExportDestination.savedDesktopName() ?? L("卷轴PDF", "Living Scroll PDF")
-        menu.items.first { $0.action == #selector(restoreExportLocation) }?.title =
-            L("恢复默认（桌面『\(name)』）", "Restore Default (“\(name)” on Desktop)")
+        if let updates = menu.items.first(where: { $0.tag == 7106 }) {
+            if let release = availableRelease, release.version != updateChecker.skippedVersion {
+                updates.title = L("有新版本 \(release.version)…", "New version \(release.version)…")
+            } else {
+                updates.title = L("检查更新…", "Check for Updates…")
+            }
+        }
+        if let item = menu.items.first(where: { $0.action == #selector(openFolder) }) {
+            let path = ExportUI.path(ScrollLibrary.shared.outputFolder)
+            item.title = L("打开输出文件夹（\(path)）", "Open Output Folder (\(path))")
+            item.toolTip = path
+            let name = ExportDestination.savedDesktopName() ?? L("卷轴PDF", "Living Scroll PDF")
+            menu.items.first { $0.action == #selector(restoreExportLocation) }?.title =
+                L("恢复默认（桌面『\(name)』）", "Restore Default (“\(name)” on Desktop)")
+        }
     }
 
     @objc private func chooseLanguage(_ sender: NSMenuItem) {
@@ -164,6 +180,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMenu()
         installEditingMenu()
         editors.forEach { $0.refreshLanguage() }
+    }
+
+    private func scheduleAutomaticUpdateCheck() {
+        guard updateChecker.shouldCheckAutomatically() else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(10))
+            guard let self else { return }
+            await self.runUpdateCheck(manual: false)
+        }
+    }
+
+    @objc private func checkForUpdates() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.runUpdateCheck(manual: true)
+        }
+    }
+
+    private func runUpdateCheck(manual: Bool) async {
+        updateChecker.markChecked()
+        do {
+            let result = try await updateChecker.check()
+            switch result {
+            case .latest(let current):
+                availableRelease = nil
+                if manual { showUpdateAlert(.latest(current: current)) }
+            case .available(let release, let current):
+                availableRelease = release
+                statusItem?.menu.map { menuNeedsUpdate($0) }
+                if manual { showUpdateAlert(.available(release, current: current)) }
+            }
+        } catch {
+            if manual { showUpdateAlert(.failed) }
+        }
+    }
+
+    private enum UpdateAlert {
+        case latest(current: String)
+        case available(AppRelease, current: String)
+        case failed
+    }
+
+    private func showUpdateAlert(_ result: UpdateAlert) {
+        let alert = NSAlert()
+        switch result {
+        case .latest(let current):
+            alert.messageText = L("已是最新版本 \(current)", "You’re up to date: \(current)")
+            alert.addButton(withTitle: L("好", "OK"))
+        case .failed:
+            alert.messageText = L("暂时无法检查更新", "Unable to check for updates right now")
+            alert.addButton(withTitle: L("好", "OK"))
+        case .available(let release, let current):
+            alert.messageText = L("有新版本 \(release.version)（当前 \(current)）", "New version \(release.version) (current \(current))")
+            let notes = Lang.isChinese ? release.notesZH : release.notesEN
+            alert.informativeText = notes.map { "• \($0)" }.joined(separator: "\n")
+            alert.addButton(withTitle: L("下载新版", "Download"))
+            alert.addButton(withTitle: L("查看全部更新日志", "View full changelog"))
+            alert.addButton(withTitle: L("以后再说", "Later"))
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(release.downloadURL)
+            } else if response == .alertSecondButtonReturn {
+                NSWorkspace.shared.open(updateChecker.changelogURL)
+            } else {
+                updateChecker.skip(version: release.version)
+                statusItem?.menu.map { menuNeedsUpdate($0) }
+            }
+            return
+        }
+        alert.runModal()
     }
 
     @objc private func choosePreloadReminder(_ sender: NSMenuItem) {
